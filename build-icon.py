@@ -13,6 +13,15 @@ blur and per-appearance fill specializations, and copies the layer assets into
 <output.icon>/Assets/.
 """
 import json, os, re, sys, shutil
+import xml.etree.ElementTree as ET
+
+# Layer/group ordering can differ between simulator extraction and host macOS CoreUI extraction.
+# default = original decant behavior: reverse layers and groups.
+# mac = preserve both as extracted.
+# no-layer-reverse = reverse groups only.
+# no-group-reverse = reverse layers only.
+ORDER_MODE = os.environ.get("DECANT_ORDER", "default").strip().lower()
+
 
 # CoreUI stores blend modes as CGBlendMode integers; .icon JSON uses names.
 BLEND = {0: "normal", 1: "multiply", 2: "screen", 3: "overlay", 4: "darken",
@@ -80,6 +89,34 @@ def fill(layer):
 def basename(layer_name):
     # "AppIcon_Assets/1.light" -> "1.light"
     return layer_name.split("/")[-1]
+
+
+def normalize_svg_copy(src, dst):
+    """Copy an SVG while making its root viewport predictable for Icon Composer.
+    CoreSVG sometimes writes Liquid Glass layer SVGs with unusual width/height
+    values.  Icon Composer appears to use those root dimensions when placing
+    artwork, which can make layers come out too large/small even when the
+    layer frame is correct.  Keep the original viewBox/artwork, but force the
+    file viewport to the 1024x1024 icon authoring canvas.
+    """
+    try:
+        ET.register_namespace('', 'http://www.w3.org/2000/svg')
+        tree = ET.parse(src)
+        root = tree.getroot()
+        # Preserve an existing viewBox. If absent, infer one from old width/height.
+        if 'viewBox' not in root.attrib:
+            def num(v):
+                if v is None: return None
+                m = re.search(r'-?\d+(?:\.\d+)?', str(v))
+                return m.group(0) if m else None
+            w = num(root.attrib.get('width')) or '1024'
+            h = num(root.attrib.get('height')) or '1024'
+            root.set('viewBox', f'0 0 {w} {h}')
+        root.set('width', '1024')
+        root.set('height', '1024')
+        tree.write(dst, encoding='utf-8', xml_declaration=True)
+    except Exception:
+        shutil.copy(src, dst)
 
 
 CANVAS = 1024.0  # icon authoring canvas is 1024x1024 points
@@ -306,8 +343,12 @@ def main():
                 continue
             ext = saved.rsplit(".", 1)[1]
             clean = basename(l["name"]) + "." + ext
-            shutil.copy(os.path.join(extract_dir, saved),
-                        os.path.join(out, "Assets", clean))
+            src_asset = os.path.join(extract_dir, saved)
+            dst_asset = os.path.join(out, "Assets", clean)
+            if ext.lower() == "svg":
+                normalize_svg_copy(src_asset, dst_asset)
+            else:
+                shutil.copy(src_asset, dst_asset)
             f0 = fill(l)
             if f0 and bottom_fill is None:
                 bottom_fill = f0  # first fill in stack order = bottom-most (backmost) layer
@@ -371,9 +412,10 @@ def main():
             lspecialize("glass", lambda x: bool(x.get("hasLightingEffects")))
             layers_out.append(layer)
 
-        # The compiled stack stores layers back-to-front; .icon lists them
-        # front-to-back, so reverse within the group.
-        layers_out.reverse()
+        # The original iOS-simulator path stores layers back-to-front; .icon lists
+        # them front-to-back. Host macOS CoreUI sometimes reports a different order.
+        if ORDER_MODE not in ("mac", "no-layer-reverse", "preserve", "none"):
+            layers_out.reverse()
 
         grp = {"hidden": False, "layers": layers_out,
                "shadow": {"kind": SHADOW.get(g.get("shadowStyle", 0), "neutral"),
@@ -399,9 +441,10 @@ def main():
             uses_specular_location = True
         groups_out.append(grp)
 
-    # The compiled stack stores groups back-to-front; .icon lists them
-    # front-to-back, so reverse the group order.
-    groups_out.reverse()
+    # The original iOS-simulator path stores groups back-to-front; .icon lists
+    # them front-to-back. Host macOS CoreUI sometimes reports a different order.
+    if ORDER_MODE not in ("mac", "no-group-reverse", "preserve", "none"):
+        groups_out.reverse()
 
     # Top-level canvas fill. Prefer the icon's authored background gradient
     # ("system-light"/"system-dark" named gradients) when present; otherwise
@@ -429,7 +472,7 @@ def main():
     icon["supported-platforms"] = {"circles": ["watchOS"], "squares": "shared"}
     json.dump(icon, open(os.path.join(out, "icon.json"), "w"), indent=2)
     nlayers = sum(len(g["layers"]) for g in groups_out)
-    print("wrote %s  (%d groups, %d layers)" % (out, len(groups_out), nlayers))
+    print("wrote %s  (%d groups, %d layers, order=%s)" % (out, len(groups_out), nlayers, ORDER_MODE))
 
 
 if __name__ == "__main__":
