@@ -31,6 +31,45 @@ static void savePNG(CGImageRef img, NSString *path) {
     CFRelease(dest);
 }
 
+
+static id callObjDirect(id obj, NSString *selName) {
+    SEL s = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:s]) return nil;
+    NSMethodSignature *sig = [obj methodSignatureForSelector:s];
+    if (!sig) return nil;
+    if (sig.numberOfArguments != 2) return nil;
+    if (sig.methodReturnType[0] != '@') return nil;
+    @try {
+        id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+        return msg(obj, s);
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static BOOL dataLooksLikeSVG(NSData *d) {
+    if (![d isKindOfClass:[NSData class]] || d.length < 16) return NO;
+    NSUInteger n = MIN((NSUInteger)4096, d.length);
+    NSString *s = [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(0, n)] encoding:NSUTF8StringEncoding];
+    if (!s) return NO;
+    return [s rangeOfString:@"<svg" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+           [s rangeOfString:@"<?xml" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static NSData *rawSVGDataForLayer(id layer, NSString **sourceOut) {
+    id rendition = callObjDirect(layer, @"_rendition");
+    if (!rendition) return nil;
+
+    for (NSString *selName in @[@"rawData", @"data", @"srcData"]) {
+        id v = callObjDirect(rendition, selName);
+        if ([v isKindOfClass:[NSData class]] && dataLooksLikeSVG((NSData *)v)) {
+            if (sourceOut) *sourceOut = [NSString stringWithFormat:@"%@.%@", NSStringFromClass([rendition class]), selName];
+            return (NSData *)v;
+        }
+    }
+    return nil;
+}
+
 static id colorJSON(CGColorRef c) {
     if (!c) return [NSNull null];
     CGColorSpaceRef cs = CGColorGetColorSpace(c);
@@ -61,8 +100,36 @@ static id val(id obj, NSString *selName) {
 
 static NSDictionary *dumpLayer(id layer, NSString *outDir, NSString *appearance) {
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
-    d[@"class"] = NSStringFromClass([layer class]);
-    for (NSString *p in @[@"name", @"opacity", @"blendMode", @"blurStrength", @"hasLightingEffects", @"gradientOrColorName", @"fixedFrame", @"gathersSpecularByElement", @"hasSpecular", @"translucency", @"shadowStyle", @"shadowOpacity", @"renditionName", @"appearance",
+    NSString *layerClassName = NSStringFromClass([layer class]);
+    d[@"class"] = layerClassName;
+
+    // Critical ordering: fetch only the layer name, then immediately try
+    // _rendition.rawData before touching svgDocument/image/frame/effect
+    // properties. Some CoreUI/CoreSVG accessors materialize a lossy
+    // regenerated SVG and make the original rawData path unavailable.
+    NSString *lname = callObjDirect(layer, @"name") ?: @"unnamed";
+    d[@"name"] = lname;
+
+    BOOL isVectorSVGLayerEarly =
+        [layer isKindOfClass:NSClassFromString(@"CUINamedVectorSVGImage")] ||
+        [layerClassName localizedCaseInsensitiveContainsString:@"VectorSVG"] ||
+        [lname localizedCaseInsensitiveContainsString:@"chiclet"] ||
+        [lname localizedCaseInsensitiveContainsString:@"bezier"];
+
+    NSData *prefetchedRawSVG = nil;
+    NSString *prefetchedRawSource = nil;
+    if (isVectorSVGLayerEarly) {
+        prefetchedRawSVG = rawSVGDataForLayer(layer, &prefetchedRawSource);
+        if (prefetchedRawSVG) {
+            d[@"rawSVGPrefetchedBeforeProperties"] = @YES;
+            d[@"rawSVGPrefetchSource"] = prefetchedRawSource ?: @"_rendition.rawData";
+            d[@"rawSVGPrefetchBytes"] = @((unsigned long)prefetchedRawSVG.length);
+        } else {
+            d[@"rawSVGPrefetchedBeforeProperties"] = @NO;
+        }
+    }
+
+    for (NSString *p in @[@"opacity", @"blendMode", @"blurStrength", @"hasLightingEffects", @"gradientOrColorName", @"fixedFrame", @"gathersSpecularByElement", @"hasSpecular", @"translucency", @"shadowStyle", @"shadowOpacity", @"renditionName", @"appearance",
                           // iOS 26+/27 Liquid Glass fields (absent in older CoreUI):
                           @"refractionStrength", @"refractionHeight", @"specularPlacement", @"sourceObjectVersion"]) {
         id v = val(layer, p);
@@ -87,7 +154,6 @@ static NSDictionary *dumpLayer(id layer, NSString *outDir, NSString *appearance)
                             @"start": [NSString stringWithFormat:@"{%g, %g}", sp.x, sp.y], @"end": [NSString stringWithFormat:@"{%g, %g}", ep.x, ep.y],
                             @"stops": (NSArray *)val(grad, @"colorStops") ?: @[], @"colors": cols };
     }
-    NSString *lname = val(layer, @"name") ?: @"unnamed";
     // image payload
     if ([layer respondsToSelector:NSSelectorFromString(@"image")] && ![layer isKindOfClass:NSClassFromString(@"CUINamedVectorSVGImage")]) {
         CGImageRef img = ((CGImageRef (*)(id, SEL))objc_msgSend)(layer, NSSelectorFromString(@"image"));
@@ -98,12 +164,39 @@ static NSDictionary *dumpLayer(id layer, NSString *outDir, NSString *appearance)
             d[@"imageSize"] = [NSString stringWithFormat:@"%zux%zu", CGImageGetWidth(img), CGImageGetHeight(img)];
         }
     }
-    if ([layer isKindOfClass:NSClassFromString(@"CUINamedVectorSVGImage")]) {
-        CGSVGDocumentRef doc = ((CGSVGDocumentRef (*)(id, SEL))objc_msgSend)(layer, NSSelectorFromString(@"svgDocument"));
-        if (doc && CGSVGDocumentWriteToURL_) {
-            NSString *fn = [NSString stringWithFormat:@"%@__%@.svg", safeName(lname), appearance];
-            CGSVGDocumentWriteToURL_(doc, (__bridge CFURLRef)[NSURL fileURLWithPath:[outDir stringByAppendingPathComponent:fn]], NULL);
+    BOOL isVectorSVGLayer = isVectorSVGLayerEarly;
+
+    if (isVectorSVGLayer) {
+        NSString *fn = [NSString stringWithFormat:@"%@__%@.svg", safeName(lname), appearance];
+        NSString *path = [outDir stringByAppendingPathComponent:fn];
+
+        // Prefer the original SVG XML preserved in the CoreUI rendition.
+        // CGSVGDocumentWriteToURL can regenerate an incomplete SVG for some
+        // Assets.car vector layers, dropping clipPath definitions while keeping
+        // clip-path references. Pixelmator's 3.chiclet.line and 5.bezier.dots
+        // are examples. This mirrors the minimal diagnostic extractor that
+        // successfully recovered _CUIThemeSVGRendition.rawData.
+        NSString *rawSource = prefetchedRawSource;
+        NSData *raw = prefetchedRawSVG;
+        if (raw) {
+            [raw writeToFile:path atomically:YES];
             d[@"savedSVG"] = fn;
+            d[@"svgSource"] = rawSource ?: @"_rendition.rawData";
+            d[@"svgBytes"] = @((unsigned long)raw.length);
+        } else {
+            SEL svgSel = NSSelectorFromString(@"svgDocument");
+            if ([layer respondsToSelector:svgSel] && CGSVGDocumentWriteToURL_) {
+                CGSVGDocumentRef doc = ((CGSVGDocumentRef (*)(id, SEL))objc_msgSend)(layer, svgSel);
+                if (doc) {
+                    CGSVGDocumentWriteToURL_(doc, (__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+                    d[@"savedSVG"] = fn;
+                    d[@"svgSource"] = @"CGSVGDocumentWriteToURL";
+                } else {
+                    d[@"svgSource"] = @"none-svgDocument-nil";
+                }
+            } else {
+                d[@"svgSource"] = @"none-no-svgDocument-selector";
+            }
         }
     }
     // recurse into sub-layers (groups)
