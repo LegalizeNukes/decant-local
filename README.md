@@ -4,7 +4,7 @@
 
 `decant-local` extracts the main macOS Liquid Glass application icon from an installed `.app` bundle and rebuilds it as an editable `.icon` bundle that can be opened in Apple's Icon Composer.
 
-This project is intended for local inspection, preservation, and icon editing workflows on your own Mac. It is a local-first adaptation of the original `decant` idea: instead of relying on simulator or IPSW assets, it reads the installed app's local `Assets.car`, extracts the main icon stack, rebuilds the icon structure, and writes the final `.icon` directly to `~/Downloads`.
+This project is intended for local inspection, preservation, and icon editing workflows on your own Mac. It is a local-first adaptation of the original `decant` project: instead of relying on simulator or IPSW assets, it reads the installed app's local `Assets.car`, extracts the main icon stack, rebuilds the icon structure, and writes the final `.icon` directly to `~/Downloads`.
 
 The default behavior is intentionally narrow:
 
