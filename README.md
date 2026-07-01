@@ -32,19 +32,19 @@ chmod +x decant decant-rawsvg-overlay.zsh
 Run it on an installed app:
 
 ```zsh
-./decant "/Applications/Pixelmator Pro Creator Studio.app"
+./decant "/Applications/Example.app"
 ```
 
 The output is written directly to Downloads:
 
 ```text
-~/Downloads/Pixelmator Pro Creator Studio.icon
+~/Downloads/Example.icon
 ```
 
 Open the result:
 
 ```zsh
-open "$HOME/Downloads/Pixelmator Pro Creator Studio.icon"
+open "$HOME/Downloads/Example.icon"
 ```
 
 For a macOS Shortcut that receives an app as input, use:
