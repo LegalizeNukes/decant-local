@@ -1,90 +1,155 @@
-# decant
+# decant-local
 
-**Decant** reverse-engineers Apple's "Liquid Glass" app icons (the iOS/macOS 26+ `.icon` format) back into an editable `.icon` bundle you can open in Icon Composer — pouring a sealed, compiled icon back out into editable source. It reads the *compiled* icon straight out of an installed iOS simulator runtime (or a mounted IPSW) using the private CoreUI framework, recovers every layer (vector SVG / raster PNG) and its full material treatment — blend mode, opacity, translucency, specular, shadow, blur, refraction, glass, per-appearance (light/dark/tinted) fills, layer transforms, and the canvas background — then reassembles a faithful `icon.json` + `Assets/` folder. Every export is verified by re-compiling it with `actool`.
+## Purpose
 
-It was built by reverse-engineering and then **round-trip–calibrated**: for each property the rebuilt icon is recompiled and re-extracted, and the values are diffed against Apple's original until they match exactly.
+`decant-local` extracts the main macOS Liquid Glass application icon from an installed `.app` bundle and rebuilds it as an editable `.icon` bundle that can be opened in Apple's Icon Composer.
 
-## Quick start
+This project is intended for local inspection, preservation, and icon editing workflows on your own Mac. It is a local-first adaptation of the original `decant` idea: instead of relying on simulator or IPSW assets, it reads the installed app's local `Assets.car`, extracts the main icon stack, rebuilds the icon structure, and writes the final `.icon` directly to `~/Downloads`.
 
-```sh
-git clone https://github.com/kylebshr/decant
-cd decant
-./decant             # export ALL runtime icons → ./icons/
-./decant --list      # list every extractable icon in your iOS runtime
-./decant Maps        # just one → ./Maps.icon, then: open Maps.icon
+The default behavior is intentionally narrow:
+
+- Extract one main app icon.
+- Write one final `.icon` file.
+- Do not export every random icon stack in the asset catalog.
+- Do not place the final output inside a folder.
+- Prefer original raw SVG data when available, so complex vector layers survive better.
+
+## Quick Start
+
+Put the project files in a folder, for example:
+
+```zsh
+/Users/yourname/Documents/Decant
 ```
 
-The runtime location is discovered automatically — you only need an iOS 26+ simulator installed in the standard place (Xcode › Settings › Components). The extractor binary is compiled on first run.
+Make the scripts executable:
 
-## Simulator or IPSW?
-
-By default decant reads icons out of your installed **iOS simulator runtime**, which is the easy path and all you need for the great majority of system apps (Maps, Photos, Safari, Settings, Weather, …). No download, no mounting.
-
-But Apple *thins* a handful of apps out of the simulator — their icons simply aren't in the runtime. The notable ones are **App Store** and **Podcasts**, plus some others that ship only on device. For those, the icon lives in an **IPSW** (the device restore image) instead. Point decant at a mounted IPSW with `--root` to pull them — and in fact to export *everything* a real device ships, including apps the simulator omits.
-
-So: reach for an IPSW when you want an app the simulator doesn't have (App Store, Podcasts, …) or a complete device-accurate set; otherwise the simulator path is simpler and faster.
-
-### Extracting from an IPSW
-
-Mount the IPSW's filesystem with [blacktop's `ipsw`](https://github.com/blacktop/ipsw) tool (`brew install blacktop/tap/ipsw`), which decrypts it and keeps it mounted while it runs:
-
-```sh
-ipsw mount fs MyDevice_27.0_Restore.ipsw      # prints a /tmp/NNN.dmg.mount path; leave running
+```zsh
+cd "/Users/yourname/Documents/Decant"
+chmod +x decant decant-rawsvg-overlay.zsh
 ```
 
-Then in another shell, point decant at that mountpoint:
+Run it on an installed app:
 
-```sh
-./decant --root /tmp/NNN.dmg.mount --list     # list every app in the image
-./decant --root /tmp/NNN.dmg.mount AppStore   # one icon → ./AppStore.icon
-./decant --root /tmp/NNN.dmg.mount            # export ALL → ./icons/
+```zsh
+./decant "/Applications/Pixelmator Pro Creator Studio.app"
 ```
 
-Press Ctrl-C on the `ipsw mount` when you're done to unmount. `--root` takes any mounted iOS filesystem; decant looks in `private/var/staged_system_apps`, `System/Applications`, and `Applications`.
+The output is written directly to Downloads:
+
+```text
+~/Downloads/Pixelmator Pro Creator Studio.icon
+```
+
+Open the result:
+
+```zsh
+open "$HOME/Downloads/Pixelmator Pro Creator Studio.icon"
+```
+
+For a macOS Shortcut that receives an app as input, use:
+
+```zsh
+cd "/Users/yourname/Documents/Decant"
+zsh ./decant "$1"
+```
 
 ## Usage
 
-```
-./decant                                # export ALL → ./icons
-./decant --all [outdir]                 # export ALL → outdir
-./decant --list                         # list available icons + stack names
-./decant <AppName|path> [Stack] [out.icon] [--preview]
-./decant --root <mountdir> …            # source from a mounted IPSW (see above)
+Basic usage:
+
+```zsh
+./decant "/Applications/App Name.app"
 ```
 
-`AppName` is a system app by name (`Maps`, `Photos`, `Safari`, `Settings`, …), resolved automatically inside the newest installed iOS simulator runtime; common friendly names are aliased to their real bundles (Safari→MobileSafari, Settings→Preferences, Messages→MobileSMS, Calendar→MobileCal, Wallet→Passbook), and `--list` shows the exact bundle names. Alternatively pass an explicit `Assets.car` / `.app` / `.framework` / `.bundle` path. `Stack` is the icon stack name (default `AppIcon`; Safari and Passwords use `AppIconUpdated`, Settings uses `Settings`). `out.icon` defaults to `./<name>.icon`. Add `--preview` to also write a flattened `<name>-preview.png` (off by default). `--root <dir>` sources icons from a mounted iOS filesystem (e.g. an IPSW mounted with `ipsw mount fs`) instead of the simulator runtime, and combines with `--list`, an `<AppName>`, or nothing (export all) — see [Simulator or IPSW?](#simulator-or-ipsw) above.
+Output naming:
 
-```sh
-./decant Photos
-./decant Safari AppIconUpdated
-./decant Settings Settings ~/Desktop/Settings.icon --preview
-./decant /path/to/Assets.car AppIcon ~/Desktop/My.icon   # explicit path
+```text
+/Users/yourname/Downloads/App Name.icon
 ```
+
+The app name is taken from the `.app` bundle name. For example:
+
+```zsh
+./decant "/System/Applications/Calendar.app"
+```
+
+creates:
+
+```text
+~/Downloads/Calendar.icon
+```
+
+The script automatically tries to identify the main app icon stack. In normal modern app bundles this is usually `AppIcon`, but some apps use a custom icon stack name. `decant-local` checks the app's asset catalog metadata and uses the most likely main icon stack.
+
+The extraction flow is:
+
+```text
+.app bundle
+  -> Contents/Resources/Assets.car
+  -> main icon stack
+  -> normal CoreUI extraction
+  -> raw SVG overlay pass
+  -> editable .icon bundle in Downloads
+```
+
+The raw SVG overlay pass is always part of the main workflow. It exists because some advanced SVG layers are damaged when exported through CoreSVG's regenerated SVG path. When original SVG bytes are available in the private rendition data, `decant-local` overlays those original SVG files onto the normal extraction before building the final `.icon`.
 
 ## Requirements
 
-macOS with Xcode 26+ command-line tools (`clang`, `actool`, `assetutil`) and `python3`, plus an installed iOS 26+ simulator runtime. The extractor runs *inside* the simulator via `simctl spawn`, because iOS 26 added refraction and specular-placement to CoreUI's icon model and an older host CoreUI can't report those fields. Without an iOS 26+ runtime the tool falls back to host extraction and warns that refraction / specular-location may be missing. (The simulator is still needed even when sourcing from an IPSW with `--root` — the IPSW only supplies the compiled catalogs; the extraction itself runs in the simulator for full iOS 26 fidelity.) Extracting from an IPSW additionally needs [blacktop's `ipsw`](https://github.com/blacktop/ipsw) (`brew install blacktop/tap/ipsw`) to decrypt and mount it.
+`decant-local` is designed for macOS and expects Apple's local icon/rendering frameworks to be present.
 
-## Files
+Required:
 
-`decant` is the entry point: it discovers the runtime (or uses the `--root` mounted filesystem), resolves the app, extracts, assembles, and validates. `icon-extract.m` is the CoreUI-based extractor (built for the iOS simulator and run inside it) that writes `extracted.json` plus the layer assets. `build-icon.py` is the assembler that turns `extracted.json` + assets into `icon.json` + `Assets/`. Running `./decant` with no args generates every extractable icon into `icons/`, which is gitignored — regenerate anytime, and nothing of Apple's gets committed.
+- macOS with Liquid Glass `.icon` / Icon Composer-era icon support.
+- Apple Command Line Tools.
+- `clang`.
+- `python3`.
+- `xcrun assetutil`.
+- Local read access to the target app's `.app` bundle.
+- The project files:
+  - `decant`
+  - `build-icon.py`
+  - `icon-extract.m`
+  - `decant-rawsvg-overlay.zsh`
 
-## How it works
+Recommended:
 
-It discovers the newest installed iOS simulator runtime root via `simctl`, opens the app's `Assets.car` with `CUICatalog`, and requests the icon stack per appearance (light / dark / tinted). It walks the `CUINamedIconLayerStack → CUINamedIconLayerGroup → layer` tree, reading each object's properties/ivars and saving each layer's artwork (`CGSVGDocument` → `.svg`, `CGImage` → `.png`). It then reassembles `icon.json`, mapping runtime enums back to the authoring vocabulary (calibrated against a known Icon Composer source): `blendMode` (CGBlendMode) → `normal`/`soft-light`/`hard-light`/`plus-lighter`/…, `shadowStyle` `0`→`none` and `3`→`neutral`, `specularPlacement` `1`→`inside` and `2`→`outside`, `refractionStrength`/`refractionHeight` → `refractivity.strength`/`depth`, per-layer `hasLightingEffects` → `glass`, the leading stack gradient → the canvas `fill`, and any per-appearance differences → `*-specializations`. Finally it validates by recompiling with `actool`.
+- Apple's Icon Composer app to open and inspect the resulting `.icon` bundle.
+- Running from Terminal or a macOS Shortcut that passes the `.app` path as an argument.
 
-## Fidelity
+Not required:
 
-These are recovered exactly, each round-trip–verified against Apple's original: layer artwork (vector SVG / raster PNG), z-order, and layer transforms (`position` = scale + translation, for offset/overflowing layers); blend modes, opacity, glass, fills (solid / 2-stop gradient) and the resolved per-appearance colors; group material — blur, translucency, specular with inside/outside placement, shadow, lighting, and refractivity (strength + depth); the canvas background (the icon's authored leading stack gradient) per appearance as a solid, `automatic-gradient`, or 2-stop `linear-gradient`; and per-appearance everything — any layer or group property that differs across light/dark/tinted is emitted as `<key>-specializations` (e.g. Photos blends `multiply` in light, `hard-light` in dark, `plus-lighter` when tinted).
+- Full Xcode installation, for the basic extraction path.
+- iOS Simulator runtime.
+- IPSW downloads.
+- `actool` validation.
 
-A few subtleties are handled explicitly. Z-order: the compiled stack stores groups *and* layers back-to-front while the `.icon` format lists them front-to-back, so both are reversed. Glass drives refraction: a group's refraction/specular only render on layers whose `glass` (= `hasLightingEffects`) is true. Artwork-colored layers: a layer with no light/dark fill uses its own SVG colors, and a tinted-only override is emitted *without* a base value so it doesn't recolor light/dark. Dropped layers: a layer that is `opacity 0` in the base appearance but visible in another (e.g. App Store's `1.light`) keeps its dark/tinted `opacity-specializations` so actool doesn't discard it.
+## What Changed
 
-Two things are inferred or lossy: `refractivity.enabled` is inferred from nonzero strength/depth (the compiler zeroes both when refraction is authored-but-disabled), and a `linear-gradient` must have exactly 2 stops, so a single stop becomes a `solid` and 3+ stops are approximated by first+last (rare).
+Compared with the original broader Decant-style workflow, `decant-local` is simplified and focused on local main-app-icon extraction.
 
-## Limits & gotchas
+Changed behavior:
 
-The icon must actually be present in the source. Some apps are *thinned* in the simulator (no embedded icon) — notably App Store and Podcasts — so they can't be extracted from a simulator; mount an **IPSW** with `--root` to get them (see [Simulator or IPSW?](#simulator-or-ipsw)). There is also a hard limit of four visible groups: `actool` rejects app icons with more than four, yet Apple's own iCloud icon uses eight, since system icons skip the public validation that third-party developers are held to. decant still **exports** such icons (it's a valid editable bundle that opens in Icon Composer) but marks them *not validated by actool* (`⚠`) — so iCloud comes out, it just can't be recompiled as a standard third-party `.icon`. A `--list` may also show stack names other than `AppIcon` (e.g. Music's `AppIcon-iOS`); pass the right stack for those, since the all-export only tries the common `AppIcon`/`AppIconUpdated` names. Finally, the flattened `--preview` PNG is a plain composite; the live glass/refraction is applied by the on-device renderer, so open the bundle in Icon Composer (or on device) to see the real effect.
+- Removed the default emphasis on exporting every icon stack.
+- Removed the normal need to pass a stack name manually.
+- Removed the final output folder behavior for normal use.
+- Final output is always a single `.icon` bundle in `~/Downloads`.
+- Main icon stack detection is automatic.
+- Raw SVG overlay is part of the default extraction path.
+- Existing output `.icon` bundles are cleared before rebuilding, avoiding stale asset files.
+- The workflow is designed around installed macOS apps, not simulator/IPSW asset sources.
 
-## Legal / scope
+Raw SVG overlay change:
 
-Uses Apple private frameworks (CoreUI, CoreSVG) for research and interop on your own machine. Don't ship the compiled binaries, and don't redistribute extracted Apple artwork — recreate your own.
+Some apps include advanced vector layers where CoreSVG's `CGSVGDocumentWriteToURL` export can produce incomplete SVGs. In affected icons, the exported SVG may reference clip paths but omit the actual `<clipPath>` definitions, causing visible rectangles, broken masks, or incorrect layer rendering in Icon Composer.
+
+`decant-local` handles this by doing a second local pass over the same icon stack and extracting original SVG bytes from `_CUIThemeSVGRendition.rawData` when available. Those original SVG files are then overlaid onto the normal extraction before `build-icon.py` creates the final `.icon` bundle.
+
+This keeps the icon layered and editable. It does not flatten the icon, delete layers, or convert SVG layers to PNG as a workaround.
+
+## Legal and Practice Notes
+
+Use this for local inspection and personal editing of app resources already on your Mac. Do not redistribute extracted artwork unless you have the rights to do so.
+
+This relies on private Apple CoreUI/CoreSVG behavior, so output may vary by macOS version. Always inspect the resulting `.icon` in Icon Composer.
