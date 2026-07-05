@@ -135,13 +135,16 @@ def parse_frame(s):
 def position_for(frame_str):
     """Convert a captured layer frame to a .icon position {scale, translation-in-points}.
     Default frame {{0,0},{1024,1024}} -> identity (returns None).
-    scale = size/canvas; translation = layer-center offset from canvas center,
+    scale = longest frame dimension / canvas; translation = layer-center offset from canvas center,
     with y measured downward (icon canvas origin is top-left)."""
     f = parse_frame(frame_str)
     if not f:
         return None
     x, y, w, h = f
-    scale = round(((w / CANVAS) + (h / CANVAS)) / 2.0, 5)
+    # .icon exposes one uniform scale value.  For non-square layers, SVG
+    # preserveAspectRatio behavior fits the artwork by its longest dimension,
+    # so averaging width and height under-scales rectangular assets.
+    scale = round(max(w, h) / CANVAS, 5)
     cx = (x + w / 2.0) - CANVAS / 2.0
     cy = (y + h / 2.0) - CANVAS / 2.0
     # near-identity -> omit
