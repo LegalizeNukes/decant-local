@@ -115,18 +115,12 @@ static void dumpLayer(id layer, NSString *outDir, NSMutableString *log, NSString
     NSString *className = NSStringFromClass([layer class]);
     NSString *name = callObj(layer, @"name") ?: className;
 
-    BOOL candidate =
-        [className localizedCaseInsensitiveContainsString:@"VectorSVG"] ||
-        [name localizedCaseInsensitiveContainsString:@"svg"] ||
-        [name localizedCaseInsensitiveContainsString:@"chiclet"] ||
-        [name localizedCaseInsensitiveContainsString:@"bezier"];
-
-    if (candidate) {
-        id rendition = callObj(layer, @"_rendition");
+    id rendition = callObj(layer, @"_rendition") ?: callObj(layer, @"rendition");
+    if (rendition) {
         [log appendFormat:@"\nLAYER: %@\n  class: %@\n  appearance: %@\n  rendition: %@\n",
          name, className, appearance, rendition ? NSStringFromClass([rendition class]) : @"nil"];
 
-        for (NSString *selectorName in @[@"rawData", @"data", @"srcData"]) {
+        for (NSString *selectorName in @[@"rawData", @"data", @"srcData", @"sourceData", @"svgData", @"vectorData"]) {
             id value = callObj(rendition, selectorName);
             if ([value isKindOfClass:[NSData class]]) {
                 NSData *data = (NSData *)value;
@@ -227,7 +221,7 @@ def parse_full(path: Path):
 
 def parse_raw(path: Path):
     stem = path.stem
-    for tail in ("__rawData", "__data", "__srcData"):
+    for tail in ("__rawData", "__data", "__srcData", "__sourceData", "__svgData", "__vectorData"):
         if stem.endswith(tail):
             stem = stem[:-len(tail)]
             break

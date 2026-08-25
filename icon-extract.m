@@ -57,10 +57,10 @@ static BOOL dataLooksLikeSVG(NSData *d) {
 }
 
 static NSData *rawSVGDataForLayer(id layer, NSString **sourceOut) {
-    id rendition = callObjDirect(layer, @"_rendition");
+    id rendition = callObjDirect(layer, @"_rendition") ?: callObjDirect(layer, @"rendition");
     if (!rendition) return nil;
 
-    for (NSString *selName in @[@"rawData", @"data", @"srcData"]) {
+    for (NSString *selName in @[@"rawData", @"data", @"srcData", @"sourceData", @"svgData", @"vectorData"]) {
         id v = callObjDirect(rendition, selName);
         if ([v isKindOfClass:[NSData class]] && dataLooksLikeSVG((NSData *)v)) {
             if (sourceOut) *sourceOut = [NSString stringWithFormat:@"%@.%@", NSStringFromClass([rendition class]), selName];
@@ -110,16 +110,18 @@ static NSDictionary *dumpLayer(id layer, NSString *outDir, NSString *appearance)
     NSString *lname = callObjDirect(layer, @"name") ?: @"unnamed";
     d[@"name"] = lname;
 
+    NSData *prefetchedRawSVG = rawSVGDataForLayer(layer, NULL);
     BOOL isVectorSVGLayerEarly =
         [layer isKindOfClass:NSClassFromString(@"CUINamedVectorSVGImage")] ||
         [layerClassName localizedCaseInsensitiveContainsString:@"VectorSVG"] ||
         [lname localizedCaseInsensitiveContainsString:@"chiclet"] ||
-        [lname localizedCaseInsensitiveContainsString:@"bezier"];
+        [lname localizedCaseInsensitiveContainsString:@"bezier"] ||
+        prefetchedRawSVG != nil ||
+        [layer respondsToSelector:NSSelectorFromString(@"svgDocument")];
 
-    NSData *prefetchedRawSVG = nil;
     NSString *prefetchedRawSource = nil;
     if (isVectorSVGLayerEarly) {
-        prefetchedRawSVG = rawSVGDataForLayer(layer, &prefetchedRawSource);
+        if (prefetchedRawSVG) rawSVGDataForLayer(layer, &prefetchedRawSource);
         if (prefetchedRawSVG) {
             d[@"rawSVGPrefetchedBeforeProperties"] = @YES;
             d[@"rawSVGPrefetchSource"] = prefetchedRawSource ?: @"_rendition.rawData";
@@ -129,9 +131,9 @@ static NSDictionary *dumpLayer(id layer, NSString *outDir, NSString *appearance)
         }
     }
 
-    for (NSString *p in @[@"opacity", @"blendMode", @"blurStrength", @"hasLightingEffects", @"gradientOrColorName", @"fixedFrame", @"gathersSpecularByElement", @"hasSpecular", @"translucency", @"shadowStyle", @"shadowOpacity", @"renditionName", @"appearance",
+    for (NSString *p in @[@"opacity", @"blendMode", @"blurStrength", @"hasLightingEffects", @"gradientOrColorName", @"fixedFrame", @"gathersSpecularByElement", @"hasSpecular", @"translucency", @"shadowStyle", @"shadowOpacity", @"renditionName", @"appearance", @"hidden",
                           // iOS 26+/27 Liquid Glass fields (absent in older CoreUI):
-                          @"refractionStrength", @"refractionHeight", @"specularPlacement", @"sourceObjectVersion"]) {
+                          @"refractionStrength", @"refractionHeight", @"refractionEnabled", @"isRefractionEnabled", @"refractivityEnabled", @"hasRefraction", @"specularPlacement", @"sourceObjectVersion"]) {
         id v = val(layer, p);
         if (v) d[p] = v;
     }
@@ -155,7 +157,7 @@ static NSDictionary *dumpLayer(id layer, NSString *outDir, NSString *appearance)
                             @"stops": (NSArray *)val(grad, @"colorStops") ?: @[], @"colors": cols };
     }
     // image payload
-    if ([layer respondsToSelector:NSSelectorFromString(@"image")] && ![layer isKindOfClass:NSClassFromString(@"CUINamedVectorSVGImage")]) {
+    if ([layer respondsToSelector:NSSelectorFromString(@"image")] && !isVectorSVGLayerEarly) {
         CGImageRef img = ((CGImageRef (*)(id, SEL))objc_msgSend)(layer, NSSelectorFromString(@"image"));
         if (img) {
             NSString *fn = [NSString stringWithFormat:@"%@__%@.png", safeName(lname), appearance];
@@ -217,6 +219,8 @@ static NSDictionary *resolveGradient(id lk, CUICatalog *cat, NSString *appearanc
     if ([lk respondsToSelector:up])
         ((void (*)(id, SEL, id, long long, long long, id))objc_msgSend)(lk, up, cat, 0LL, 0LL, appearance);
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    id name = val(lk, @"name");
+    if (name) d[@"name"] = name;
     NSArray *cols = val(lk, @"colors");
     if (cols) {
         NSMutableArray *cj = [NSMutableArray array];

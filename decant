@@ -22,6 +22,10 @@ usage: ./decant /path/to/App.app
 
 Output is written directly to:
   ~/Downloads/<App Name>.icon
+
+Optional format override for ambiguous icons:
+  DECANT_FORMAT=26 ./decant /path/to/App.app
+  DECANT_FORMAT=27 ./decant /path/to/App.app
 EOF
   exit 2
 }

@@ -11,6 +11,9 @@ plus the per-layer .svg/.png assets). It reconstructs icon.json with the
 layer/group hierarchy, blend modes, opacity, translucency, specular, shadow,
 blur and per-appearance fill specializations, and copies the layer assets into
 <output.icon>/Assets/.
+
+Set DECANT_FORMAT=26 or DECANT_FORMAT=27 to override automatic Icon Composer
+schema detection for an unusually simple icon with no version-specific effects.
 """
 import json, os, re, sys, shutil
 import xml.etree.ElementTree as ET
@@ -21,6 +24,7 @@ import xml.etree.ElementTree as ET
 # no-layer-reverse = reverse groups only.
 # no-group-reverse = reverse layers only.
 ORDER_MODE = os.environ.get("DECANT_ORDER", "default").strip().lower()
+FORMAT_MODE = os.environ.get("DECANT_FORMAT", "auto").strip().lower()
 
 
 # CoreUI stores blend modes as CGBlendMode integers; .icon JSON uses names.
@@ -35,7 +39,7 @@ SHADOW = {0: "none", 3: "neutral"}
 SPEC_PLACEMENT = {1: "inside", 2: "outside"}
 # CGColorSpace name -> .icon color-space token
 CS = {"kCGColorSpaceDisplayP3": "display-p3", "kCGColorSpaceSRGB": "srgb",
-      "kCGColorSpaceExtendedSRGB": "srgb", "kCGColorSpaceGenericRGB": "srgb",
+      "kCGColorSpaceExtendedSRGB": "extended-srgb", "kCGColorSpaceGenericRGB": "srgb",
       "kCGColorSpaceGenericGrayGamma2_2": "gray", "kCGColorSpaceLinearGray": "gray",
       "kCGColorSpaceGenericGray": "gray"}
 
@@ -185,12 +189,15 @@ def _auto_gradient(entry):
     return f
 
 
-def cf_to_fill(cf):
+def cf_to_fill(cf, preserve_system_name=False):
     """Convert a captured canvasFill (leading stack gradient) into a .icon fill.
     A multi-stop gradient becomes a `linear-gradient` (round-trips exactly); a
     single stop becomes an `automatic-gradient`."""
     if not cf:
         return None
+    name = str(cf.get("name") or "").split("/")[-1]
+    if preserve_system_name and name in ("system-light", "system-dark"):
+        return name
     cols = cf.get("colors") or []
     if not cols:
         return None
@@ -210,23 +217,20 @@ def canvas_fill(d, base_key, other):
     """Top-level fill from per-appearance canvasFills (the leading stack
     gradient), with dark/tinted specializations when they differ."""
     base_cf = (d.get(base_key) or {}).get("canvasFill")
-    base_fill = cf_to_fill(base_cf)
+    base_fill = cf_to_fill(base_cf, preserve_system_name=True)
     if not base_fill:
-        return None
+        return None, []
     diffs = []
     for k, tag in other:
         if tag is None:
             continue
-        f = cf_to_fill((d.get(k) or {}).get("canvasFill"))
+        f = cf_to_fill((d.get(k) or {}).get("canvasFill"), preserve_system_name=True)
         if f and f != base_fill:
             diffs.append((tag, f))
-    if diffs:
-        specs = [{"value": dict(base_fill)}]
-        for tag, f in diffs:
-            specs.append({"appearance": tag, "value": f})
-        base_fill = dict(base_fill)
-        base_fill["fill-specializations"] = specs
-    return base_fill
+    specs = [{"value": base_fill}] + [
+        {"appearance": tag, "value": f} for tag, f in diffs
+    ] if diffs else []
+    return base_fill, specs
 
 
 def index_appearance(appdata):
@@ -235,7 +239,7 @@ def index_appearance(appdata):
     if not isinstance(appdata, dict):
         return m
     for gi, g in enumerate(appdata["groups"]):
-        if g.get("class") != "CUINamedIconLayerGroup":
+        if not is_icon_group(g):
             continue
         for li, l in enumerate(g.get("layers", [])):
             m[(gi, li)] = l
@@ -243,6 +247,35 @@ def index_appearance(appdata):
 
 
 # --- group property values (computed from a raw extracted group dict) ---
+
+def is_icon_group(g):
+    """Accept the original CoreUI class and renamed/private subclasses."""
+    return "IconLayerGroup" in str(g.get("class") or "")
+
+
+def uses_macos27_schema(d):
+    """Detect Icon Composer 2 metadata, with an override for ambiguous icons."""
+    if FORMAT_MODE in ("27", "macos27", "v2"):
+        return True
+    if FORMAT_MODE in ("26", "macos26", "v1"):
+        return False
+    if FORMAT_MODE != "auto":
+        raise ValueError("DECANT_FORMAT must be auto, 26, or 27")
+    new_keys = {
+        "refractionStrength", "refractionHeight", "refractionEnabled",
+        "isRefractionEnabled", "refractivityEnabled", "hasRefraction",
+        "specularPlacement",
+    }
+    for appearance in d.values():
+        if not isinstance(appearance, dict):
+            continue
+        pending = list(appearance.get("groups") or [])
+        while pending:
+            item = pending.pop()
+            if any(key in item for key in new_keys):
+                return True
+            pending.extend(item.get("layers") or [])
+    return False
 
 def g_blend(g):
     return BLEND.get(g.get("blendMode", 0), "normal")
@@ -268,7 +301,18 @@ def g_blur(g):
 def g_refractivity(g):
     s = round(g.get("refractionStrength", 0) or 0, 4)
     h = round(g.get("refractionHeight", 0) or 0, 4)
-    return {"enabled": True, "strength": s, "depth": h} if (s or h) else None
+    enabled_keys = ("refractionEnabled", "isRefractionEnabled", "refractivityEnabled", "hasRefraction")
+    enabled = next((bool(g[k]) for k in enabled_keys if k in g), None)
+    if enabled is None and not (s or h):
+        return None
+    if enabled is None:
+        enabled = True
+    return {"enabled": enabled, "strength": s, "depth": h}
+
+
+def g_refractivity_enabled(g):
+    value = g_refractivity(g)
+    return bool(value and value["enabled"])
 
 
 def specialize(grp, key, value_fn, base_g, peers):
@@ -303,7 +347,7 @@ def group_list(appdata):
     """Ordered list of real icon-layer groups for an appearance."""
     if not isinstance(appdata, dict):
         return []
-    return [g for g in appdata["groups"] if g.get("class") == "CUINamedIconLayerGroup"]
+    return [g for g in appdata["groups"] if is_icon_group(g)]
 
 
 def main():
@@ -318,8 +362,16 @@ def main():
         base_key = next(k for k, v in d.items()
                         if isinstance(v, dict) and "groups" in v)
     base = d[base_key]
-    other = [(k, tag) for k, tag in APPEARANCE_TAGS
-             if k != base_key and isinstance(d.get(k), dict)]
+    other = []
+    seen_specializations = set()
+    for k, tag in APPEARANCE_TAGS:
+        if k == base_key or not isinstance(d.get(k), dict):
+            continue
+        if tag is not None:
+            if tag in seen_specializations:
+                continue
+            seen_specializations.add(tag)
+        other.append((k, tag))
     idx = {k: index_appearance(d[k]) for k, _ in other}
     # Per-appearance group lists, aligned by real-group ordinal, for group-level
     # specializations (blend-mode, specular, translucency, etc. that vary by mode).
@@ -333,12 +385,13 @@ def main():
     uses_specular_location = False
 
     for gi, g in enumerate(base["groups"]):
-        if g.get("class") != "CUINamedIconLayerGroup":
+        if not is_icon_group(g):
             continue  # skip top-level gradient/color placeholder entries
         base_rgi += 1
         # aligned peer groups in other appearances (by real-group ordinal)
         peers = [(tag, (glist[base_rgi] if base_rgi < len(glist) else None))
                  for tag, glist in other_groups]
+        group_pos = position_for(g.get("frame"))
         layers_out = []
         for li, l in enumerate(g.get("layers", [])):
             saved = l.get("savedSVG") or l.get("savedImage")
@@ -366,8 +419,10 @@ def main():
                     overrides.append({"appearance": tag, "value": fa})
             layer = {"image-name": clean, "name": basename(l["name"])}
             pos = position_for(l.get("frame"))
-            if pos:
+            if pos and pos != group_pos:
                 layer["position"] = pos
+            if "hidden" in l:
+                layer["hidden"] = bool(l["hidden"])
             # Fill emission. A base fill of None means "no override — use the
             # artwork's own colors" (e.g. an SVG with its own gradient). In that
             # case only the appearance overrides go into fill-specializations,
@@ -420,9 +475,13 @@ def main():
         if ORDER_MODE not in ("mac", "no-layer-reverse", "preserve", "none"):
             layers_out.reverse()
 
-        grp = {"hidden": False, "layers": layers_out,
+        grp = {"hidden": bool(g.get("hidden", False)), "layers": layers_out,
                "shadow": {"kind": SHADOW.get(g.get("shadowStyle", 0), "neutral"),
                           "opacity": round(g.get("shadowOpacity", 0.5), 4)}}
+        if g.get("name"):
+            grp["name"] = basename(g["name"])
+        if group_pos:
+            grp["position"] = group_pos
         # Group properties that can vary per appearance -> emit a scalar, or a
         # `<key>-specializations` array when light/dark/tinted differ.
         specialize(grp, "blend-mode", g_blend, g, peers)
@@ -437,7 +496,7 @@ def main():
             specialize(grp, "blur-material", g_blur, g, peers)
 
         # feature flags (consider all appearances)
-        if g_refractivity(g) or any(og and g_refractivity(og) for _, og in peers):
+        if g_refractivity_enabled(g) or any(og and g_refractivity_enabled(og) for _, og in peers):
             uses_refraction = True
         if g_specular(g) in ("inside", "outside") or \
            any(og and g_specular(og) in ("inside", "outside") for _, og in peers):
@@ -452,7 +511,7 @@ def main():
     # Top-level canvas fill. Prefer the icon's authored background gradient
     # ("system-light"/"system-dark" named gradients) when present; otherwise
     # fall back to deriving from the bottom-most layer's fill.
-    top_fill = canvas_fill(d, base_key, other)
+    top_fill, top_fill_specs = canvas_fill(d, base_key, other)
     if top_fill is None:
         if bottom_fill and "solid" in bottom_fill:
             top_fill = {"automatic-gradient": bottom_fill["solid"]}
@@ -470,9 +529,15 @@ def main():
     icon = {}
     if features:
         icon["features"] = features
-    icon["fill"] = top_fill
+    if top_fill_specs:
+        icon["fill-specializations"] = top_fill_specs
+    else:
+        icon["fill"] = top_fill
     icon["groups"] = groups_out
-    icon["supported-platforms"] = {"circles": ["watchOS"], "squares": "shared"}
+    if uses_macos27_schema(d):
+        icon["supported-platforms"] = {"squares": "shared"}
+    else:
+        icon["supported-platforms"] = {"squares": ["macOS"]}
     json.dump(icon, open(os.path.join(out, "icon.json"), "w"), indent=2)
     nlayers = sum(len(g["layers"]) for g in groups_out)
     print("wrote %s  (%d groups, %d layers, order=%s)" % (out, len(groups_out), nlayers, ORDER_MODE))
