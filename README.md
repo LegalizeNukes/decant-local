@@ -26,7 +26,7 @@ chmod +x decant
 Pass either an app bundle or an `Assets.car` file:
 
 ```zsh
-./decant "/Applications/Pages.app"
+./decant "/Applications/App Store.app"
 ./decant "/path/to/Assets.car"
 ```
 
@@ -38,13 +38,13 @@ Keep the complete work directory, including `extracted.json`, the
 reconstruction report, recovered assets, and generated helper sources:
 
 ```zsh
-DECANT_KEEP_WORK=1 ./decant "/Applications/Pages.app"
+DECANT_KEEP_WORK=1 ./decant "/Applications/App Store.app"
 ```
 
 Require a clean coverage report:
 
 ```zsh
-DECANT_STRICT=1 ./decant "/Applications/Pages.app"
+DECANT_STRICT=1 ./decant "/Applications/App Store.app"
 ```
 
 Strict mode still writes the recovered icon but returns status `3` when a
