@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-VERSION="4.0.0"
+VERSION="4.0.1"
 
 usage() {
   local exit_code="${1:-2}"
@@ -784,20 +784,21 @@ BLEND = {0: "normal", 1: "multiply", 2: "screen", 3: "overlay", 4: "darken",
          9: "hard-light", 10: "difference", 11: "exclusion", 12: "hue",
          13: "saturation", 14: "color", 15: "luminosity",
          26: "plus-darker", 27: "plus-lighter"}
-# shadowStyle integer -> .icon shadow kind (calibrated against a known source icon)
-SHADOW = {0: "none", 2: "chromatic", 3: "neutral"}
+# shadowStyle integer -> .icon shadow kind. CoreUI style 2 is not stable enough
+# to serialize as Chromatic across the v26/v27 Icon Composer schemas; the
+# legacy-safe Neutral representation opens correctly in both.
+SHADOW = {0: "none", 2: "neutral", 3: "neutral"}
 # specularPlacement integer -> .icon specular location (calibrated: 1=inside, 2=outside)
 SPEC_PLACEMENT = {1: "inside", 2: "outside"}
 # CGColorSpace name -> .icon color-space token
 CS = {"kCGColorSpaceDisplayP3": "display-p3", "kCGColorSpaceSRGB": "srgb",
       "kCGColorSpaceExtendedSRGB": "extended-srgb", "kCGColorSpaceGenericRGB": "srgb",
-      # Icon Composer serializes grayscale colors as extended-gray.  The old
-      # `gray` token was not one of the tokens emitted by the app and could be
-      # interpreted differently by newer releases.
-      "kCGColorSpaceGenericGrayGamma2_2": "extended-gray",
-      "kCGColorSpaceLinearGray": "extended-gray",
-      "kCGColorSpaceGenericGray": "extended-gray",
-      "kCGColorSpaceExtendedGray": "extended-gray"}
+      # `gray` remains accepted by both target schemas and is more compatible
+      # with v26 documents than the newer `extended-gray` spelling.
+      "kCGColorSpaceGenericGrayGamma2_2": "gray",
+      "kCGColorSpaceLinearGray": "gray",
+      "kCGColorSpaceGenericGray": "gray",
+      "kCGColorSpaceExtendedGray": "gray"}
 
 # Appearance keys emitted by icon-extract -> .icon "appearance" tag (None = default/light)
 APPEARANCE_TAGS = [
@@ -841,14 +842,10 @@ def colstr(c):
     space = CS.get(c["colorspace"], "srgb")
     comp = c["components"]
     # 1-2 component colors are grayscale (value [,alpha]) regardless of space name.
-    if space in ("gray", "extended-gray") or len(comp) < 3:
+    if space == "gray" or len(comp) < 3:
         v = comp[0]
         a = comp[-1] if len(comp) >= 2 else 1.0
-        # Untagged two-component colors arrive without a reliable CoreGraphics
-        # space name.  Icon Composer's current schema spelling is
-        # `extended-gray`, so do not silently fall back to the legacy token.
-        prefix = space if space in ("gray", "extended-gray") else "extended-gray"
-        return "%s:%.5f,%.5f" % (prefix, v, a)
+        return "gray:%.5f,%.5f" % (v, a)
     if len(comp) >= 4:
         return "%s:%.5f,%.5f,%.5f,%.5f" % (space, comp[0], comp[1], comp[2], comp[3])
     return "%s:%.5f,%.5f,%.5f,1.00000" % (space, comp[0], comp[1], comp[2])
@@ -911,13 +908,10 @@ def normalize_svg_copy(src, dst):
         ET.register_namespace('', 'http://www.w3.org/2000/svg')
         tree = ET.parse(src)
         root = tree.getroot()
-        # Raw rendition SVGs that already have a viewBox are the original
-        # artwork and must remain byte-for-byte intact.  Only repair SVGs whose
-        # root has no usable coordinate system.
-        if 'viewBox' in root.attrib:
-            shutil.copy2(src, dst)
-            return
-        else:
+        # Preserve the original coordinate system, but always provide the
+        # explicit 1024-point viewport Icon Composer expects. Missing root
+        # dimensions made some bundles fail to open and under-scaled WhatsApp.
+        if 'viewBox' not in root.attrib:
             def num(v):
                 if v is None: return None
                 m = re.search(r'-?\d+(?:\.\d+)?', str(v))
@@ -1249,13 +1243,11 @@ def g_specular(g):
 def g_translucency(g):
     enabled_keys = ("translucencyEnabled", "isTranslucencyEnabled", "hasTranslucency")
     enabled = next((bool(g[k]) for k in enabled_keys if k in g), None)
-    # CoreUI's compiled layer-group object does not expose a separate switch on
-    # either the v26 (CoreUI 974) or v27 (CoreUI 1010) catalogs tested. Across
-    # Apple's v27 system icons the compiled convention is zero = disabled and
-    # any nonzero amount = enabled. One remains a valid enabled amount (Pages'
-    # dark pen highlight is an important example).
+    # CoreUI frequently omits the separate switch. The amount alone cannot
+    # determine it: working catalogs use both 0 and 1 while the effect remains
+    # enabled. Preserve the editable effect unless an explicit switch says no.
     if enabled is None:
-        enabled = abs(float(g.get("translucency", 0) or 0)) > 1e-7
+        enabled = True
     return {"enabled": enabled,
             "value": round(g.get("translucency", 1), 4)}
 
@@ -1398,7 +1390,7 @@ def reconstruction_report(d, extract_dir, icon, format27):
                 "code": "compiled-translucency-switch", "path": path,
                 "amount": amount,
                 "inferred-enabled": abs(amount) > 1e-7,
-                "message": "CoreUI stores the rendered translucency switch in the compiled amount: zero is off and nonzero is on."
+                "message": "CoreUI omitted the translucency switch; Decant preserves the effect as enabled and retains its compiled amount."
             })
 
         colors = []
