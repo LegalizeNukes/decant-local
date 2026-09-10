@@ -1,0 +1,1839 @@
+#!/bin/zsh
+# Decant 4 — recover an editable macOS 26/27 .icon bundle from an app or Assets.car.
+# This file is self-contained: its Objective-C extractors and Python builder are
+# embedded below and are unpacked only into the run's temporary work directory.
+
+set -euo pipefail
+
+VERSION="4.0.0"
+
+usage() {
+  local exit_code="${1:-2}"
+  cat >&2 <<'EOF'
+usage: ./decant /path/to/App.app
+   or: ./decant /path/to/Assets.car
+
+Output:
+  ~/Downloads/<App Name>.icon
+
+Optional environment variables:
+  DECANT_FORMAT=26|27  Override automatic schema detection
+  DECANT_KEEP_WORK=1   Keep and print the diagnostic work directory
+  DECANT_STRICT=1      Return status 3 when fidelity warnings remain
+EOF
+  exit "$exit_code"
+}
+
+die() {
+  print -u2 "error: $*"
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+  usage 0
+fi
+if [[ $# -eq 1 && "$1" == "--version" ]]; then
+  print "Decant $VERSION"
+  exit 0
+fi
+[[ $# -eq 1 ]] || usage
+
+require_command clang
+require_command python3
+require_command xcrun
+
+INPUT="$1"
+[[ -e "$INPUT" ]] || die "not found: $INPUT"
+
+CAR=""
+APP_NAME=""
+BUNDLE_ICON_NAME=""
+
+if [[ "$INPUT" == *.app ]]; then
+  CAR="$INPUT/Contents/Resources/Assets.car"
+  APP_NAME="${INPUT:t:r}"
+
+  if [[ -f "$INPUT/Contents/Info.plist" ]]; then
+    BUNDLE_ICON_NAME=$(/usr/libexec/PlistBuddy \
+      -c 'Print :CFBundleIconName' "$INPUT/Contents/Info.plist" 2>/dev/null || true)
+  fi
+else
+  CAR="$INPUT"
+  APP_NAME="${INPUT:t:r}"
+fi
+
+[[ -f "$CAR" ]] || die "Assets.car not found: $CAR"
+
+TMPBASE="${TMPDIR:-/tmp}"
+WORK=$(mktemp -d "${TMPBASE%/}/decant.XXXXXX") || die "could not make work directory"
+EXTRACT_DIR="$WORK/extract"
+RAW_SVG_DIR="$WORK/raw-svg"
+SOURCE_DIR="$WORK/source"
+RESULT_ICON="$WORK/result.icon"
+OUT_ICON="$HOME/Downloads/$APP_NAME.icon"
+
+mkdir -p "$EXTRACT_DIR" "$RAW_SVG_DIR" "$SOURCE_DIR" "$HOME/Downloads"
+
+cleanup() {
+  local exit_code=$?
+  if [[ "${DECANT_KEEP_WORK:-0}" == 1 ]]; then
+    print "work retained -> $WORK"
+  else
+    /bin/rm -rf -- "$WORK"
+  fi
+  return $exit_code
+}
+trap cleanup EXIT
+
+[[ "${DECANT_KEEP_WORK:-0}" == 1 ]] && print "work -> $WORK"
+
+META_SRC="$SOURCE_DIR/icon-extract.m"
+RAW_SRC="$SOURCE_DIR/rawsvg-extract.m"
+BUILDER="$SOURCE_DIR/build-icon.py"
+
+cat > "$META_SRC" <<'__DECANT_META_OBJC__'
+#import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <dlfcn.h>
+#import <string.h>
+
+typedef struct CGSVGDocument *CGSVGDocumentRef;
+static void (*CGSVGDocumentWriteToURL_)(CGSVGDocumentRef, CFURLRef, CFDictionaryRef);
+
+@interface CUICatalog : NSObject
+- (instancetype)initWithURL:(NSURL *)url error:(NSError **)error;
+- (id)_namedLookupWithName:(NSString *)name scaleFactor:(double)scale deviceIdiom:(long long)idiom deviceSubtype:(unsigned long long)subtype displayGamut:(long long)gamut layoutDirection:(long long)dir sizeClassHorizontal:(long long)h sizeClassVertical:(long long)v appearanceName:(NSString *)appearance locale:(NSString *)locale;
+- (id)iconLayerStackWithName:(NSString *)name scaleFactor:(double)scale deviceIdiom:(long long)idiom deviceSubtype:(unsigned long long)subtype displayGamut:(long long)gamut appearanceName:(NSString *)appearance locale:(NSString *)locale;
+- (CGColorRef)colorWithName:(NSString *)name displayGamut:(long long)gamut deviceIdiom:(long long)idiom appearanceName:(NSString *)appearance;
+- (id)_appearancefallback_gradientWithName:(NSString *)name displayGamut:(long long)gamut deviceIdiom:(long long)idiom appearanceName:(NSString *)appearance;
+- (NSArray *)allImageNames;
+- (void)enumerateNamedLookupsUsingBlock:(void (^)(id))block;
+@end
+
+static NSString *safeName(NSString *n) {
+    return [[n stringByReplacingOccurrencesOfString:@"/" withString:@"__"] stringByReplacingOccurrencesOfString:@" " withString:@"_"];
+}
+
+static void savePNG(CGImageRef img, NSString *path) {
+    if (!img) return;
+    CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], CFSTR("public.png"), 1, NULL);
+    if (!dest) return;
+    CGImageDestinationAddImage(dest, img, NULL);
+    CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+}
+
+
+static id callObjDirect(id obj, NSString *selName) {
+    SEL s = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:s]) return nil;
+    NSMethodSignature *sig = [obj methodSignatureForSelector:s];
+    if (!sig) return nil;
+    if (sig.numberOfArguments != 2) return nil;
+    if (sig.methodReturnType[0] != '@') return nil;
+    @try {
+        id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+        return msg(obj, s);
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static BOOL dataLooksLikeSVG(NSData *d) {
+    if (![d isKindOfClass:[NSData class]] || d.length < 16) return NO;
+    NSUInteger n = MIN((NSUInteger)4096, d.length);
+    NSString *s = [[NSString alloc] initWithData:[d subdataWithRange:NSMakeRange(0, n)] encoding:NSUTF8StringEncoding];
+    if (!s) return NO;
+    return [s rangeOfString:@"<svg" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+           [s rangeOfString:@"<?xml" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static NSData *rawSVGDataForLayer(id layer, NSString **sourceOut) {
+    id rendition = callObjDirect(layer, @"_rendition") ?: callObjDirect(layer, @"rendition");
+    if (!rendition) return nil;
+
+    for (NSString *selName in @[@"rawData", @"data", @"srcData", @"sourceData", @"svgData", @"vectorData"]) {
+        id v = callObjDirect(rendition, selName);
+        if ([v isKindOfClass:[NSData class]] && dataLooksLikeSVG((NSData *)v)) {
+            if (sourceOut) *sourceOut = [NSString stringWithFormat:@"%@.%@", NSStringFromClass([rendition class]), selName];
+            return (NSData *)v;
+        }
+    }
+    return nil;
+}
+
+static id colorJSON(CGColorRef c) {
+    if (!c) return [NSNull null];
+    CGColorSpaceRef cs = CGColorGetColorSpace(c);
+    CFStringRef csName = cs ? CGColorSpaceCopyName(cs) : NULL;
+    size_t n = CGColorGetNumberOfComponents(c);
+    const CGFloat *comp = CGColorGetComponents(c);
+    NSMutableArray *arr = [NSMutableArray array];
+    for (size_t i=0;i<n;i++) [arr addObject:@(comp[i])];
+    return @{ @"colorspace": csName ? (__bridge_transfer NSString*)csName : @"?", @"components": arr };
+}
+
+static id val(id obj, NSString *selName) {
+    SEL s = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:s]) return nil;
+    NSMethodSignature *sig = [obj methodSignatureForSelector:s];
+    if (!sig || sig.numberOfArguments != 2) return nil;
+    const char *rt = sig.methodReturnType;
+    while (*rt && strchr("rnNoORV", *rt)) rt++;
+    @try {
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        inv.target = obj; inv.selector = s;
+        [inv invoke];
+        switch (rt[0]) {
+            case '@': { __unsafe_unretained id r=nil; [inv getReturnValue:&r]; return r; }
+            case '#': { Class r=Nil; [inv getReturnValue:&r]; return r ? NSStringFromClass(r) : nil; }
+            case 'B': { BOOL x=NO; [inv getReturnValue:&x]; return @(x); }
+            case 'c': { char x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'C': { unsigned char x=0; [inv getReturnValue:&x]; return @(x); }
+            case 's': { short x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'S': { unsigned short x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'i': { int x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'I': { unsigned int x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'l': { long x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'L': { unsigned long x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'q': { long long x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'Q': { unsigned long long x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'f': { float x=0; [inv getReturnValue:&x]; return @(x); }
+            case 'd': { double x=0; [inv getReturnValue:&x]; return @(x); }
+            case ':': { SEL x=NULL; [inv getReturnValue:&x]; return x ? NSStringFromSelector(x) : nil; }
+            case '*': { const char *x=NULL; [inv getReturnValue:&x]; return x ? [NSString stringWithUTF8String:x] : nil; }
+            default: break;
+        }
+        if (strcmp(rt, @encode(CGPoint)) == 0) {
+            CGPoint x=CGPointZero; [inv getReturnValue:&x];
+            return @[@(x.x), @(x.y)];
+        }
+        if (strcmp(rt, @encode(CGSize)) == 0) {
+            CGSize x=CGSizeZero; [inv getReturnValue:&x];
+            return @[@(x.width), @(x.height)];
+        }
+        if (strcmp(rt, @encode(CGRect)) == 0) {
+            CGRect x=CGRectZero; [inv getReturnValue:&x];
+            return @{ @"x":@(x.origin.x), @"y":@(x.origin.y),
+                      @"width":@(x.size.width), @"height":@(x.size.height) };
+        }
+        if (strcmp(rt, @encode(CGAffineTransform)) == 0) {
+            CGAffineTransform x=CGAffineTransformIdentity; [inv getReturnValue:&x];
+            return @{ @"a":@(x.a), @"b":@(x.b), @"c":@(x.c), @"d":@(x.d),
+                      @"tx":@(x.tx), @"ty":@(x.ty) };
+        }
+        // Preserve an otherwise unknown struct as typed bytes. This is not
+        // directly translatable, but makes a new CoreUI metadata field visible
+        // to reconstruction-report.json instead of silently losing it.
+        if (rt[0] == '{') {
+            NSUInteger size=0;
+            NSGetSizeAndAlignment(rt, &size, NULL);
+            if (size > 0 && size <= 512) {
+                NSMutableData *data=[NSMutableData dataWithLength:size];
+                [inv getReturnValue:data.mutableBytes];
+                const unsigned char *bytes=data.bytes;
+                NSMutableString *hex=[NSMutableString stringWithCapacity:size*2];
+                for (NSUInteger i=0; i<size; i++) [hex appendFormat:@"%02x", bytes[i]];
+                return @{ @"encoding": [NSString stringWithUTF8String:rt] ?: @"?",
+                          @"bytes-hex": hex };
+            }
+        }
+    } @catch (__unused NSException *e) {}
+    return nil;
+}
+
+static NSString *clippedDescription(id value) {
+    NSString *s=[value description] ?: @"";
+    return s.length > 4096 ? [[s substringToIndex:4096] stringByAppendingString:@"…"] : s;
+}
+
+static id jsonSafe(id value, NSUInteger depth) {
+    if (!value) return nil;
+    if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]] ||
+        [value isKindOfClass:[NSNull class]]) return value;
+    if ([value isKindOfClass:[NSData class]])
+        return @{ @"class": NSStringFromClass([value class]), @"bytes": @([(NSData *)value length]) };
+    if (depth >= 3)
+        return @{ @"class": NSStringFromClass([value class]), @"description": clippedDescription(value) };
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out=[NSMutableArray array];
+        NSUInteger count=0;
+        for (id item in (NSArray *)value) {
+            if (count++ >= 64) break;
+            [out addObject:jsonSafe(item, depth+1) ?: [NSNull null]];
+        }
+        return out;
+    }
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out=[NSMutableDictionary dictionary];
+        NSUInteger count=0;
+        for (id key in (NSDictionary *)value) {
+            if (count++ >= 64) break;
+            NSString *ks=[key isKindOfClass:[NSString class]] ? key : [key description];
+            out[ks ?: @"?"] = jsonSafe(((NSDictionary *)value)[key], depth+1) ?: [NSNull null];
+        }
+        return out;
+    }
+    return @{ @"class": NSStringFromClass([value class]),
+              @"description": clippedDescription(value) };
+}
+
+static BOOL metadataAccessorName(NSString *name) {
+    NSString *n=[name lowercaseString];
+    for (NSString *needle in @[@"blur", @"shadow", @"specular", @"transluc", @"refract",
+                               @"light", @"opacity", @"blend", @"hidden", @"frame",
+                               @"position", @"size", @"version", @"color", @"gradient",
+                               @"appearance", @"rendition", @"scale", @"transform", @"material"])
+        if ([n containsString:needle]) return YES;
+    return NO;
+}
+
+static NSDictionary *runtimeMetadata(id obj) {
+    NSMutableDictionary *values=[NSMutableDictionary dictionary];
+    NSMutableDictionary *types=[NSMutableDictionary dictionary];
+    NSMutableSet *seen=[NSMutableSet set];
+    NSSet *skip=[NSSet setWithArray:@[@"image", @"svgDocument", @"rawData", @"dataRepresentation"]];
+
+    for (Class cls=[obj class]; cls && cls != [NSObject class]; cls=class_getSuperclass(cls)) {
+        unsigned int count=0;
+        objc_property_t *props=class_copyPropertyList(cls, &count);
+        for (unsigned int i=0; i<count; i++) {
+            NSString *name=[NSString stringWithUTF8String:property_getName(props[i])];
+            if ([seen containsObject:name] || [skip containsObject:name]) continue;
+            [seen addObject:name];
+            const char *attrs=property_getAttributes(props[i]);
+            if (attrs) types[name]=[NSString stringWithUTF8String:attrs];
+            NSString *getter=name;
+            if (attrs) {
+                const char *g=strstr(attrs, ",G");
+                if (g) {
+                    g += 2; const char *end=strchr(g, ',');
+                    getter=[[NSString alloc] initWithBytes:g length:(end ? (NSUInteger)(end-g) : strlen(g)) encoding:NSUTF8StringEncoding] ?: name;
+                }
+            }
+            id v=val(obj, getter);
+            if (v) values[name]=jsonSafe(v, 0);
+        }
+        free(props);
+
+        // Private CoreUI revisions often add a zero-argument accessor without
+        // declaring an Objective-C property. Capture metadata-shaped methods as
+        // well so a new OS field is visible to the translator and diagnostics.
+        Method *methods=class_copyMethodList(cls, &count);
+        for (unsigned int i=0; i<count; i++) {
+            SEL selector=method_getName(methods[i]);
+            NSString *name=NSStringFromSelector(selector);
+            if ([name containsString:@":"] || [seen containsObject:name] ||
+                [skip containsObject:name] || !metadataAccessorName(name)) continue;
+            [seen addObject:name];
+            const char *encoding=method_getTypeEncoding(methods[i]);
+            if (encoding) types[name]=[NSString stringWithUTF8String:encoding];
+            id v=val(obj, name);
+            if (v) values[name]=jsonSafe(v, 0);
+        }
+        free(methods);
+    }
+    return @{ @"values": values, @"types": types };
+}
+
+static NSDictionary *dumpLayer(id layer, NSString *outDir, NSString *appearance) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    NSString *layerClassName = NSStringFromClass([layer class]);
+    d[@"class"] = layerClassName;
+
+    // Critical ordering: fetch only the layer name, then immediately try
+    // _rendition.rawData before touching svgDocument/image/frame/effect
+    // properties. Some CoreUI/CoreSVG accessors materialize a lossy
+    // regenerated SVG and make the original rawData path unavailable.
+    NSString *lname = callObjDirect(layer, @"name") ?: @"unnamed";
+    d[@"name"] = lname;
+
+    NSData *prefetchedRawSVG = rawSVGDataForLayer(layer, NULL);
+    BOOL isVectorSVGLayerEarly =
+        [layer isKindOfClass:NSClassFromString(@"CUINamedVectorSVGImage")] ||
+        [layerClassName localizedCaseInsensitiveContainsString:@"VectorSVG"] ||
+        [lname localizedCaseInsensitiveContainsString:@"chiclet"] ||
+        [lname localizedCaseInsensitiveContainsString:@"bezier"] ||
+        prefetchedRawSVG != nil ||
+        [layer respondsToSelector:NSSelectorFromString(@"svgDocument")];
+
+    NSString *prefetchedRawSource = nil;
+    if (isVectorSVGLayerEarly) {
+        if (prefetchedRawSVG) rawSVGDataForLayer(layer, &prefetchedRawSource);
+        if (prefetchedRawSVG) {
+            d[@"rawSVGPrefetchedBeforeProperties"] = @YES;
+            d[@"rawSVGPrefetchSource"] = prefetchedRawSource ?: @"_rendition.rawData";
+            d[@"rawSVGPrefetchBytes"] = @((unsigned long)prefetchedRawSVG.length);
+        } else {
+            d[@"rawSVGPrefetchedBeforeProperties"] = @NO;
+        }
+    }
+
+    for (NSString *p in @[@"opacity", @"blendMode", @"blurStrength", @"blurEnabled", @"isBlurEnabled", @"hasBlur",
+                          @"hasLightingEffects", @"gradientOrColorName", @"fixedFrame", @"gathersSpecularByElement", @"hasSpecular",
+                          @"translucency", @"translucencyEnabled", @"isTranslucencyEnabled", @"hasTranslucency",
+                          @"shadowStyle", @"shadowOpacity", @"shadowEnabled", @"isShadowEnabled", @"hasShadow",
+                          @"renditionName", @"appearance", @"hidden",
+                          // iOS 26+/27 Liquid Glass fields (absent in older CoreUI):
+                          @"refractionStrength", @"refractivityStrength",
+                          @"refractionHeight", @"refractionDepth", @"refractivityDepth",
+                          @"refractionEnabled", @"isRefractionEnabled",
+                          @"refractivityEnabled", @"isRefractivityEnabled",
+                          @"hasRefraction", @"hasRefractivity",
+                          @"specularPlacement", @"specularLocation",
+                          @"sourceObjectVersion"]) {
+        id v = val(layer, p);
+        if (v) d[p] = v;
+    }
+    d[@"runtimeMetadata"] = runtimeMetadata(layer);
+    if ([layer respondsToSelector:@selector(frame)]) {
+        CGRect f = ((CGRect (*)(id, SEL))objc_msgSend)(layer, @selector(frame));
+        d[@"frame"] = [NSString stringWithFormat:@"{{%g, %g}, {%g, %g}}", f.origin.x, f.origin.y, f.size.width, f.size.height];
+    }
+    // color fill
+    if ([layer respondsToSelector:NSSelectorFromString(@"color")]) {
+        CGColorRef c = ((CGColorRef (*)(id, SEL))objc_msgSend)(layer, NSSelectorFromString(@"color"));
+        if (c) d[@"color"] = colorJSON(c);
+    }
+    id grad = val(layer, @"gradient");
+    if (grad) {
+        NSMutableArray *cols = [NSMutableArray array];
+        for (id c in (NSArray *)val(grad, @"colors")) cols[cols.count] = colorJSON((__bridge CGColorRef)c);
+        CGPoint sp = ((CGPoint (*)(id, SEL))objc_msgSend)(grad, NSSelectorFromString(@"gradientStartPoint"));
+        CGPoint ep = ((CGPoint (*)(id, SEL))objc_msgSend)(grad, NSSelectorFromString(@"gradientEndPoint"));
+        d[@"gradient"] = @{ @"name": val(grad, @"name") ?: @"?", @"type": val(grad, @"gradientType") ?: @(-1),
+                            @"start": [NSString stringWithFormat:@"{%g, %g}", sp.x, sp.y], @"end": [NSString stringWithFormat:@"{%g, %g}", ep.x, ep.y],
+                            @"stops": (NSArray *)val(grad, @"colorStops") ?: @[], @"colors": cols };
+    }
+    // image payload
+    if ([layer respondsToSelector:NSSelectorFromString(@"image")] && !isVectorSVGLayerEarly) {
+        CGImageRef img = ((CGImageRef (*)(id, SEL))objc_msgSend)(layer, NSSelectorFromString(@"image"));
+        if (img) {
+            NSString *fn = [NSString stringWithFormat:@"%@__%@.png", safeName(lname), appearance];
+            savePNG(img, [outDir stringByAppendingPathComponent:fn]);
+            d[@"savedImage"] = fn;
+            d[@"imageSize"] = [NSString stringWithFormat:@"%zux%zu", CGImageGetWidth(img), CGImageGetHeight(img)];
+        }
+    }
+    BOOL isVectorSVGLayer = isVectorSVGLayerEarly;
+
+    if (isVectorSVGLayer) {
+        NSString *fn = [NSString stringWithFormat:@"%@__%@.svg", safeName(lname), appearance];
+        NSString *path = [outDir stringByAppendingPathComponent:fn];
+
+        // Prefer the original SVG XML preserved in the CoreUI rendition.
+        // CGSVGDocumentWriteToURL can regenerate an incomplete SVG for some
+        // Assets.car vector layers, dropping clipPath definitions while keeping
+        // clip-path references. Pixelmator's 3.chiclet.line and 5.bezier.dots
+        // are examples. This mirrors the minimal diagnostic extractor that
+        // successfully recovered _CUIThemeSVGRendition.rawData.
+        NSString *rawSource = prefetchedRawSource;
+        NSData *raw = prefetchedRawSVG;
+        if (raw) {
+            [raw writeToFile:path atomically:YES];
+            d[@"savedSVG"] = fn;
+            d[@"svgSource"] = rawSource ?: @"_rendition.rawData";
+            d[@"svgBytes"] = @((unsigned long)raw.length);
+        } else {
+            SEL svgSel = NSSelectorFromString(@"svgDocument");
+            if ([layer respondsToSelector:svgSel] && CGSVGDocumentWriteToURL_) {
+                CGSVGDocumentRef doc = ((CGSVGDocumentRef (*)(id, SEL))objc_msgSend)(layer, svgSel);
+                if (doc) {
+                    CGSVGDocumentWriteToURL_(doc, (__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+                    d[@"savedSVG"] = fn;
+                    d[@"svgSource"] = @"CGSVGDocumentWriteToURL";
+                } else {
+                    d[@"svgSource"] = @"none-svgDocument-nil";
+                }
+            } else {
+                d[@"svgSource"] = @"none-no-svgDocument-selector";
+            }
+        }
+    }
+    // recurse into sub-layers (groups)
+    NSArray *sub = val(layer, @"layers");
+    if (sub) {
+        NSMutableArray *subDumps = [NSMutableArray array];
+        for (id sl in sub) [subDumps addObject:dumpLayer(sl, outDir, appearance)];
+        d[@"layers"] = subDumps;
+    }
+    return d;
+}
+
+// Resolve a named gradient/color lookup for a given appearance and return its
+// colors/stops/orientation. The enumerated lookup must be refreshed via
+// _updateFromCatalog: before its colors populate.
+static NSDictionary *resolveGradient(id lk, CUICatalog *cat, NSString *appearance) {
+    SEL up = NSSelectorFromString(@"_updateFromCatalog:displayGamut:deviceIdiom:appearanceName:");
+    if ([lk respondsToSelector:up])
+        ((void (*)(id, SEL, id, long long, long long, id))objc_msgSend)(lk, up, cat, 0LL, 0LL, appearance);
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    id name = val(lk, @"name");
+    if (name) d[@"name"] = name;
+    NSArray *cols = val(lk, @"colors");
+    if (cols) {
+        NSMutableArray *cj = [NSMutableArray array];
+        for (id c in cols) [cj addObject:colorJSON((__bridge CGColorRef)c)];
+        d[@"colors"] = cj;
+    }
+    id stops = val(lk, @"colorStops");
+    if (stops) d[@"stops"] = stops;
+    id type = val(lk, @"gradientType");
+    if (type) d[@"type"] = type;
+    if ([lk respondsToSelector:NSSelectorFromString(@"gradientStartPoint")]) {
+        CGPoint sp = ((CGPoint (*)(id, SEL))objc_msgSend)(lk, NSSelectorFromString(@"gradientStartPoint"));
+        CGPoint ep = ((CGPoint (*)(id, SEL))objc_msgSend)(lk, NSSelectorFromString(@"gradientEndPoint"));
+        d[@"start"] = @[@(sp.x), @(sp.y)];
+        d[@"end"] = @[@(ep.x), @(ep.y)];
+    }
+    return d;
+}
+
+int main(int argc, char **argv) {
+    @autoreleasepool {
+        // Flat framework path works on both macOS (top-level symlink) and iOS (flat layout).
+        dlopen("/System/Library/PrivateFrameworks/CoreUI.framework/CoreUI", RTLD_NOW);
+        void *svg = dlopen("/System/Library/PrivateFrameworks/CoreSVG.framework/CoreSVG", RTLD_NOW);
+        CGSVGDocumentWriteToURL_ = dlsym(svg, "CGSVGDocumentWriteToURL");
+        NSString *carPath = argc > 1 ? @(argv[1]) : @"/System/Applications/App Store.app/Contents/Resources/Assets.car";
+        NSString *iconName = argc > 2 ? @(argv[2]) : @"AppIcon";
+        NSString *outDir = argc > 3 ? @(argv[3]) : [@"~/Desktop/AppStoreIcon-extract" stringByExpandingTildeInPath];
+        [[NSFileManager defaultManager] createDirectoryAtPath:outDir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSError *err = nil;
+        CUICatalog *cat = [[NSClassFromString(@"CUICatalog") alloc] initWithURL:[NSURL fileURLWithPath:carPath] error:&err];
+        if (!cat) { fprintf(stderr, "catalog open failed: %s\n", err.description.UTF8String); return 1; }
+
+        NSMutableDictionary *result = [NSMutableDictionary dictionary];
+        NSBundle *coreUIBundle=[NSBundle bundleWithPath:@"/System/Library/PrivateFrameworks/CoreUI.framework"];
+        NSOperatingSystemVersion osv=[NSProcessInfo processInfo].operatingSystemVersion;
+        result[@"_decant"] = @{
+            @"extractorSchema": @2,
+            @"operatingSystemVersion": [NSString stringWithFormat:@"%ld.%ld.%ld",
+                                          (long)osv.majorVersion, (long)osv.minorVersion,
+                                          (long)osv.patchVersion],
+            @"operatingSystemBuild": [[NSProcessInfo processInfo] operatingSystemVersionString] ?: @"?",
+            @"coreUIBundleVersion": [coreUIBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?",
+            @"coreUIShortVersion": [coreUIBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?",
+        };
+        // macOS icons use NSAppearanceName*; iOS icons use UIAppearance* and a nil/light default.
+        // NSNull marks the nil ("default light") lookup; keyed as "Default" in output.
+        NSArray *appearances = @[@"NSAppearanceNameAqua", @"NSAppearanceNameDarkAqua",
+                                 @"ISAppearanceTintable", @"UIAppearanceAny", @"UIAppearanceDark",
+                                 [NSNull null], @"UIAppearanceLight"];
+        for (id appObj in appearances) {
+            NSString *app = [appObj isKindOfClass:[NSNull class]] ? nil : appObj;
+            NSString *key = app ?: @"Default";
+            if (result[key]) continue;  // avoid dup if a name resolves to same as Default
+            id stack = [cat iconLayerStackWithName:iconName scaleFactor:1 deviceIdiom:0 deviceSubtype:0 displayGamut:0 appearanceName:app locale:nil];
+            if (!stack) { result[key] = @"NOT FOUND"; continue; }
+            NSMutableDictionary *sd = [NSMutableDictionary dictionary];
+            sd[@"class"] = NSStringFromClass([stack class]);
+            sd[@"runtimeMetadata"] = runtimeMetadata(stack);
+            id rp = val(stack, @"renderingProperties");
+            if (rp) sd[@"renderingProperties"] = [rp description];
+            if ([stack respondsToSelector:NSSelectorFromString(@"dataRepresentationWithError:")]) {
+                NSError *e2 = nil;
+                NSData *data = ((NSData *(*)(id, SEL, NSError **))objc_msgSend)(stack, NSSelectorFromString(@"dataRepresentationWithError:"), &e2);
+                if (data) {
+                    NSString *fn = [NSString stringWithFormat:@"%@__%@.dataRep", iconName, key];
+                    [data writeToFile:[outDir stringByAppendingPathComponent:fn] atomically:YES];
+                    sd[@"dataRepFile"] = fn;
+                }
+            }
+            NSArray *groups = val(stack, @"layers");
+            // The canvas background fill is a leading CUINamedGradient/Color in the
+            // stack (before the first icon-layer group). Resolve it per appearance.
+            for (id g in groups) {
+                NSString *gcls = NSStringFromClass([g class]);
+                if ([gcls containsString:@"LayerGroup"]) break;  // reached real layers
+                if ([gcls containsString:@"Gradient"]) {
+                    sd[@"canvasFill"] = resolveGradient(g, cat, app);
+                    break;
+                }
+                if ([gcls containsString:@"Color"]) {
+                    // CUINamedColor exposes -cgColor (already resolved for this appearance).
+                    CGColorRef cc = NULL;
+                    if ([g respondsToSelector:NSSelectorFromString(@"cgColor")])
+                        cc = ((CGColorRef (*)(id, SEL))objc_msgSend)(g, NSSelectorFromString(@"cgColor"));
+                    if (cc) sd[@"canvasFill"] = @{ @"colors": @[colorJSON(cc)] };
+                    break;
+                }
+            }
+            NSMutableArray *gd = [NSMutableArray array];
+            for (id g in groups) [gd addObject:dumpLayer(g, outDir, key)];
+            sd[@"groups"] = gd;
+            result[key] = sd;
+        }
+
+        // Capture the canvas background gradient(s). Layered icons store it as
+        // named gradients "<prefix>/system-light" and "system-dark".
+        @try {
+            NSMutableArray *bgLookups = [NSMutableArray array];
+            [cat enumerateNamedLookupsUsingBlock:^(id lk) {
+                NSString *nm = val(lk, @"name");
+                if (nm && [nm containsString:@"system-"]) [bgLookups addObject:lk];
+            }];
+            NSMutableDictionary *bg = [NSMutableDictionary dictionary];
+            for (id lk in bgLookups) {
+                NSString *nm = val(lk, @"name");
+                NSString *leaf = [nm componentsSeparatedByString:@"/"].lastObject; // system-light/dark/any
+                NSMutableDictionary *byApp = [NSMutableDictionary dictionary];
+                for (NSString *app in @[@"UIAppearanceLight", @"UIAppearanceDark"]) {
+                    NSDictionary *g = resolveGradient(lk, cat, app);
+                    if (g.count) byApp[app] = g;
+                }
+                if (byApp.count) bg[leaf] = byApp;
+            }
+            if (bg.count) result[@"_background"] = bg;
+        } @catch (NSException *ex) { /* background is best-effort */ }
+
+        {
+            NSError *we=nil;
+            NSData *j0=[NSJSONSerialization dataWithJSONObject:result options:NSJSONWritingPrettyPrinted|NSJSONWritingSortedKeys error:&we];
+            if (!j0) { fprintf(stderr, "json fail: %s\n", we.description.UTF8String); return 1; }
+            [j0 writeToFile:[outDir stringByAppendingPathComponent:@"extracted.json"] atomically:YES];
+        }
+        printf("done -> %s\n", outDir.UTF8String);
+    }
+    return 0;
+}
+__DECANT_META_OBJC__
+
+cat > "$RAW_SRC" <<'__DECANT_RAW_OBJC__'
+#import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <dlfcn.h>
+
+@interface CUICatalog : NSObject
+- (instancetype)initWithURL:(NSURL *)url error:(NSError **)error;
+- (id)iconLayerStackWithName:(NSString *)name scaleFactor:(double)scale deviceIdiom:(long long)idiom deviceSubtype:(unsigned long long)subtype displayGamut:(long long)gamut appearanceName:(NSString *)appearance locale:(NSString *)locale;
+@end
+
+static id callObj(id obj, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:sel]) return nil;
+
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    if (!sig || sig.numberOfArguments != 2 || sig.methodReturnType[0] != '@') return nil;
+
+    @try {
+        id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+        return msg(obj, sel);
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static NSString *safeFileName(NSString *s) {
+    NSMutableString *m = [s mutableCopy];
+    NSCharacterSet *bad = [NSCharacterSet characterSetWithCharactersInString:@"/:\\?%*|\"<> "];
+    for (NSUInteger i = 0; i < m.length; i++) {
+        if ([bad characterIsMember:[m characterAtIndex:i]]) {
+            [m replaceCharactersInRange:NSMakeRange(i, 1) withString:@"_"];
+        }
+    }
+    return m;
+}
+
+static BOOL looksLikeSVG(NSData *data) {
+    if (![data isKindOfClass:[NSData class]] || data.length < 16) return NO;
+    NSUInteger length = MIN((NSUInteger)4096, data.length);
+    NSData *head = [data subdataWithRange:NSMakeRange(0, length)];
+    NSString *text = [[NSString alloc] initWithData:head encoding:NSUTF8StringEncoding];
+    if (!text) return NO;
+    return [text rangeOfString:@"<svg" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+           [text rangeOfString:@"<?xml" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static void dumpLayer(id layer, NSString *outDir, NSMutableString *log, NSString *appearance) {
+    NSString *className = NSStringFromClass([layer class]);
+    NSString *name = callObj(layer, @"name") ?: className;
+
+    id rendition = callObj(layer, @"_rendition") ?: callObj(layer, @"rendition");
+    if (rendition) {
+        [log appendFormat:@"\nLAYER: %@\n  class: %@\n  appearance: %@\n  rendition: %@\n",
+         name, className, appearance, rendition ? NSStringFromClass([rendition class]) : @"nil"];
+
+        for (NSString *selectorName in @[@"rawData", @"data", @"srcData", @"sourceData", @"svgData", @"vectorData"]) {
+            id value = callObj(rendition, selectorName);
+            if ([value isKindOfClass:[NSData class]]) {
+                NSData *data = (NSData *)value;
+                BOOL isSVG = looksLikeSVG(data);
+                [log appendFormat:@"  %@: %lu bytes looksLikeSVG=%@\n",
+                 selectorName, (unsigned long)data.length, isSVG ? @"YES" : @"NO"];
+
+                if (isSVG) {
+                    NSString *fileName = [NSString stringWithFormat:@"%@__%@__%@.svg",
+                                          safeFileName(name), appearance, selectorName];
+                    NSString *path = [outDir stringByAppendingPathComponent:fileName];
+                    [data writeToFile:path atomically:YES];
+                    [log appendFormat:@"    wrote %@\n", fileName];
+                    break;
+                }
+            } else {
+                [log appendFormat:@"  %@: %@\n", selectorName, value ? NSStringFromClass([value class]) : @"nil"];
+            }
+        }
+    }
+
+    id children = callObj(layer, @"layers");
+    if ([children isKindOfClass:[NSArray class]]) {
+        for (id child in (NSArray *)children) dumpLayer(child, outDir, log, appearance);
+    }
+}
+
+int main(int argc, char **argv) {
+    @autoreleasepool {
+        if (argc < 4) return 2;
+
+        dlopen("/System/Library/PrivateFrameworks/CoreUI.framework/CoreUI", RTLD_NOW);
+
+        NSString *carPath = @(argv[1]);
+        NSString *stackName = @(argv[2]);
+        NSString *outDir = @(argv[3]);
+
+        NSError *error = nil;
+        CUICatalog *catalog = [[NSClassFromString(@"CUICatalog") alloc]
+                               initWithURL:[NSURL fileURLWithPath:carPath]
+                               error:&error];
+        if (!catalog) {
+            fprintf(stderr, "catalog open failed: %s\n", error.description.UTF8String);
+            return 1;
+        }
+
+        NSMutableString *log = [NSMutableString string];
+        // Query every appearance naming family used by CoreUI. Some macOS 27
+        // system apps (Books, Clock and FaceTime) store their icon stack under
+        // UIAppearanceLight/UIAppearanceDark rather than NSAppearanceName*.
+        NSArray *appearances = @[@"NSAppearanceNameAqua", @"NSAppearanceNameDarkAqua",
+                                 @"ISAppearanceTintable", @"UIAppearanceAny",
+                                 @"UIAppearanceDark", [NSNull null], @"UIAppearanceLight"];
+
+        for (id appearanceObject in appearances) {
+            NSString *appearance = [appearanceObject isKindOfClass:[NSNull class]] ? nil : appearanceObject;
+            NSString *appearanceKey = appearance ?: @"Default";
+            id stack = [catalog iconLayerStackWithName:stackName
+                                           scaleFactor:1
+                                           deviceIdiom:0
+                                         deviceSubtype:0
+                                          displayGamut:0
+                                        appearanceName:appearance
+                                                locale:nil];
+            [log appendFormat:@"\n===== %@ =====\n", appearanceKey];
+            if (stack) dumpLayer(stack, outDir, log, appearanceKey);
+            else [log appendString:@"STACK NOT FOUND\n"];
+        }
+
+        [log writeToFile:[outDir stringByAppendingPathComponent:@"rawsvg-log.txt"]
+              atomically:YES
+                encoding:NSUTF8StringEncoding
+                   error:nil];
+    }
+    return 0;
+}
+__DECANT_RAW_OBJC__
+
+cat > "$BUILDER" <<'__DECANT_BUILDER_PY__'
+#!/usr/bin/env python3
+"""
+build-icon.py — assemble an openable .icon bundle from an extracted.json
+produced by icon-extract.
+
+Usage:
+    build-icon.py <extract-dir> <output.icon> [raw-svg-dir]
+
+<extract-dir> is the directory icon-extract wrote (containing extracted.json
+plus the per-layer .svg/.png assets). It reconstructs icon.json with the
+layer/group hierarchy, blend modes, opacity, translucency, specular, shadow,
+blur and per-appearance fill specializations, and copies the layer assets into
+<output.icon>/Assets/. When raw-svg-dir is supplied, original SVG rendition
+bytes from the minimal extraction pass replace CoreSVG-generated fallbacks
+before the bundle is assembled.
+
+Set DECANT_FORMAT=26 or DECANT_FORMAT=27 to override automatic Icon Composer
+schema detection for an unusually simple icon with no version-specific effects.
+
+A reconstruction-report.json is written beside extracted.json. Set
+DECANT_STRICT=1 to return a failure status whenever CoreUI exposes active
+metadata that cannot be represented confidently in the selected .icon schema.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import xml.etree.ElementTree as ET
+
+FORMAT_MODE = os.environ.get("DECANT_FORMAT", "auto").strip().lower()
+STRICT_MODE = os.environ.get("DECANT_STRICT", "0").strip().lower() in ("1", "true", "yes")
+
+
+# CoreUI stores blend modes as CGBlendMode integers; .icon JSON uses names.
+BLEND = {0: "normal", 1: "multiply", 2: "screen", 3: "overlay", 4: "darken",
+         5: "lighten", 6: "color-dodge", 7: "color-burn", 8: "soft-light",
+         9: "hard-light", 10: "difference", 11: "exclusion", 12: "hue",
+         13: "saturation", 14: "color", 15: "luminosity",
+         26: "plus-darker", 27: "plus-lighter"}
+# shadowStyle integer -> .icon shadow kind (calibrated against a known source icon)
+SHADOW = {0: "none", 2: "chromatic", 3: "neutral"}
+# specularPlacement integer -> .icon specular location (calibrated: 1=inside, 2=outside)
+SPEC_PLACEMENT = {1: "inside", 2: "outside"}
+# CGColorSpace name -> .icon color-space token
+CS = {"kCGColorSpaceDisplayP3": "display-p3", "kCGColorSpaceSRGB": "srgb",
+      "kCGColorSpaceExtendedSRGB": "extended-srgb", "kCGColorSpaceGenericRGB": "srgb",
+      # Icon Composer serializes grayscale colors as extended-gray.  The old
+      # `gray` token was not one of the tokens emitted by the app and could be
+      # interpreted differently by newer releases.
+      "kCGColorSpaceGenericGrayGamma2_2": "extended-gray",
+      "kCGColorSpaceLinearGray": "extended-gray",
+      "kCGColorSpaceGenericGray": "extended-gray",
+      "kCGColorSpaceExtendedGray": "extended-gray"}
+
+# Appearance keys emitted by icon-extract -> .icon "appearance" tag (None = default/light)
+APPEARANCE_TAGS = [
+    ("Default", None), ("NSAppearanceNameAqua", None),
+    ("UIAppearanceAny", None), ("UIAppearanceLight", None),
+    ("NSAppearanceNameDarkAqua", "dark"), ("UIAppearanceDark", "dark"),
+    ("ISAppearanceTintable", "tinted"),
+]
+# Preferred order for choosing the structural base (light/default appearance).
+BASE_PREFERENCE = ["Default", "NSAppearanceNameAqua", "UIAppearanceAny", "UIAppearanceLight"]
+
+# CoreUI accessors whose values are deliberately translated into .icon JSON.
+# The runtime extractor also records newly introduced properties.  Anything
+# metadata-shaped outside this set is surfaced in reconstruction-report.json so
+# a future macOS release cannot be mistaken for a lossless conversion.
+MAPPED_ACCESSORS = {
+    "opacity", "blendMode", "blurStrength", "blurEnabled", "isBlurEnabled", "hasBlur",
+    "hasLightingEffects", "gathersSpecularByElement", "hasSpecular",
+    "translucency", "translucencyEnabled", "isTranslucencyEnabled", "hasTranslucency",
+    "shadowStyle", "shadowOpacity", "shadowEnabled", "isShadowEnabled", "hasShadow",
+    "hidden", "frame", "position", "fixedFrame", "color", "gradient",
+    "colors", "colorStops", "gradientStartPoint", "gradientEndPoint", "gradientType",
+    "refractionStrength", "refractivityStrength", "refractionHeight",
+    "refractionDepth", "refractivityDepth", "refractionEnabled",
+    "isRefractionEnabled", "refractivityEnabled", "isRefractivityEnabled",
+    "hasRefraction", "hasRefractivity", "specularPlacement", "specularLocation",
+}
+
+# Useful catalog identity/provenance values which do not correspond to editable
+# Icon Composer controls and therefore do not need an icon.json field.
+INFORMATIONAL_ACCESSORS = {
+    "name", "class", "layers", "appearance", "rendition", "_rendition",
+    "renditionName", "sourceObjectVersion", "renderingProperties", "scale",
+    "size", "imageSize", "gradientOrColorName", "dataRepFile",
+}
+
+
+def colstr(c):
+    if not c:
+        return None
+    space = CS.get(c["colorspace"], "srgb")
+    comp = c["components"]
+    # 1-2 component colors are grayscale (value [,alpha]) regardless of space name.
+    if space in ("gray", "extended-gray") or len(comp) < 3:
+        v = comp[0]
+        a = comp[-1] if len(comp) >= 2 else 1.0
+        # Untagged two-component colors arrive without a reliable CoreGraphics
+        # space name.  Icon Composer's current schema spelling is
+        # `extended-gray`, so do not silently fall back to the legacy token.
+        prefix = space if space in ("gray", "extended-gray") else "extended-gray"
+        return "%s:%.5f,%.5f" % (prefix, v, a)
+    if len(comp) >= 4:
+        return "%s:%.5f,%.5f,%.5f,%.5f" % (space, comp[0], comp[1], comp[2], comp[3])
+    return "%s:%.5f,%.5f,%.5f,1.00000" % (space, comp[0], comp[1], comp[2])
+
+
+def parse_point(value):
+    """Return a two-component point from NSArray JSON or CoreUI's '{x, y}'."""
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return float(value[0]), float(value[1])
+    if isinstance(value, str):
+        nums = re.findall(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", value)
+        if len(nums) >= 2:
+            return float(nums[0]), float(nums[1])
+    return None
+
+
+def gradient_fill(entry):
+    """A .icon linear-gradient must have exactly 2 colors. 1 color -> solid;
+    >2 colors -> approximate with first+last (actool rejects other counts)."""
+    cols = entry.get("colors") or []
+    cs = [colstr(c) for c in cols]
+    if not cs:
+        return None
+    if len(cs) == 1:
+        return {"solid": cs[0]}
+    if len(cs) == 2:
+        result = {"linear-gradient": cs}
+    else:
+        result = {"linear-gradient": [cs[0], cs[-1]]}
+    orientation = _orientation(entry)
+    if orientation:
+        result["orientation"] = orientation
+    return result
+
+
+def fill(layer):
+    g = layer.get("gradient")
+    if g and g.get("colors"):
+        return gradient_fill(g)
+    c = layer.get("color")
+    if c:
+        return {"solid": colstr(c)}
+    return None
+
+
+def basename(layer_name):
+    # "AppIcon_Assets/1.light" -> "1.light"
+    return layer_name.split("/")[-1]
+
+
+def normalize_svg_copy(src, dst):
+    """Copy an SVG while making its root viewport predictable for Icon Composer.
+    CoreSVG sometimes writes Liquid Glass layer SVGs with unusual width/height
+    values.  Icon Composer appears to use those root dimensions when placing
+    artwork, which can make layers come out too large/small even when the
+    layer frame is correct.  Keep the original viewBox/artwork, but force the
+    file viewport to the 1024x1024 icon authoring canvas.
+    """
+    try:
+        ET.register_namespace('', 'http://www.w3.org/2000/svg')
+        tree = ET.parse(src)
+        root = tree.getroot()
+        # Raw rendition SVGs that already have a viewBox are the original
+        # artwork and must remain byte-for-byte intact.  Only repair SVGs whose
+        # root has no usable coordinate system.
+        if 'viewBox' in root.attrib:
+            shutil.copy2(src, dst)
+            return
+        else:
+            def num(v):
+                if v is None: return None
+                m = re.search(r'-?\d+(?:\.\d+)?', str(v))
+                return m.group(0) if m else None
+            w = num(root.attrib.get('width')) or '1024'
+            h = num(root.attrib.get('height')) or '1024'
+            root.set('viewBox', f'0 0 {w} {h}')
+        root.set('width', '1024')
+        root.set('height', '1024')
+        tree.write(dst, encoding='utf-8', xml_declaration=True)
+    except Exception:
+        shutil.copy(src, dst)
+
+
+CANVAS = 1024.0  # icon authoring canvas is 1024x1024 points
+
+
+def parse_frame(s):
+    """'{{x, y}, {w, h}}' -> (x, y, w, h) floats, or None."""
+    if not s:
+        return None
+    nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+    if len(nums) < 4:
+        return None
+    return tuple(float(n) for n in nums[:4])
+
+
+def position_for(frame_str):
+    """Convert a captured layer frame to a .icon position {scale, translation-in-points}.
+    Default frame {{0,0},{1024,1024}} -> identity (returns None).
+    scale = longest frame dimension / canvas; translation = layer-center offset from canvas center,
+    with y measured downward (icon canvas origin is top-left)."""
+    f = parse_frame(frame_str)
+    if not f:
+        return None
+    x, y, w, h = f
+    # .icon exposes one uniform scale value.  For non-square layers, SVG
+    # preserveAspectRatio behavior fits the artwork by its longest dimension,
+    # so averaging width and height under-scales rectangular assets.
+    scale = round(max(w, h) / CANVAS, 5)
+    cx = (x + w / 2.0) - CANVAS / 2.0
+    cy = (y + h / 2.0) - CANVAS / 2.0
+    # near-identity -> omit
+    if abs(scale - 1.0) < 1e-3 and abs(cx) < 1.0 and abs(cy) < 1.0:
+        return None
+    return {"scale": scale,
+            "translation-in-points": [round(cx, 3), round(cy, 3)]}
+
+
+def _orientation(entry):
+    s = parse_point(entry.get("start")); e = parse_point(entry.get("end"))
+    if not (s and e):
+        return None
+    return {"start": {"x": round(s[0], 4), "y": round(s[1], 4)},
+            "stop": {"x": round(e[0], 4), "y": round(e[1], 4)}}
+
+
+def is_system_dark_gradient(cf):
+    """Recognize Apple's compiled macOS 26 System Dark background.
+
+    Assets.car resolves semantic system fills to concrete colors, so the
+    original `system-dark` label is no longer present.  Re-semanticizing this
+    exact, public-system signature lets a v26 icon adopt the v27 System Dark
+    appearance and lighting model when opened by the newer Icon Composer.
+    """
+    if not cf:
+        return False
+    name = str(cf.get("name") or "").split("/")[-1]
+    if name == "system-dark":
+        return True
+    colors = cf.get("colors") or []
+    if len(colors) != 2:
+        return False
+    values = []
+    for color in colors:
+        components = color.get("components") or []
+        if len(components) < 1 or color.get("colorspace") not in {
+                "kCGColorSpaceGenericGrayGamma2_2", "kCGColorSpaceLinearGray",
+                "kCGColorSpaceGenericGray", "kCGColorSpaceExtendedGray"}:
+            return False
+        values.append(float(components[0]))
+        if len(components) >= 2 and abs(float(components[-1]) - 1.0) > 0.0005:
+            return False
+    start = parse_point(cf.get("start"))
+    end = parse_point(cf.get("end"))
+    vertical = (start is not None and end is not None and
+                abs(start[0] - 0.5) < 0.001 and abs(start[1]) < 0.001 and
+                abs(end[0] - 0.5) < 0.001 and abs(end[1] - 1.0) < 0.001)
+    return vertical and abs(values[0] - 0.192) < 0.0005 and abs(values[1] - 0.078) < 0.0005
+
+
+def cf_to_fill(cf, preserve_system_name=False, appearance=None):
+    """Convert a captured canvasFill (leading stack gradient) into a .icon fill.
+    A multi-stop gradient becomes a `linear-gradient` (round-trips exactly); a
+    single stop becomes an `automatic-gradient`."""
+    if not cf:
+        return None
+    name = str(cf.get("name") or "").split("/")[-1]
+    if preserve_system_name and name in ("system-light", "system-dark"):
+        return name
+    if preserve_system_name and appearance == "dark" and is_system_dark_gradient(cf):
+        return "system-dark"
+    cols = cf.get("colors") or []
+    if not cols:
+        return None
+    if len(cols) == 1:
+        f = {"automatic-gradient": colstr(cols[0])}
+    elif len(cols) == 2:
+        f = {"linear-gradient": [colstr(c) for c in cols]}
+    else:
+        f = {"linear-gradient": [colstr(cols[0]), colstr(cols[-1])]}
+    o = _orientation(cf)
+    if o:
+        f["orientation"] = o
+    return f
+
+
+def canvas_fill(d, base_key, other):
+    """Top-level fill from per-appearance canvasFills (the leading stack
+    gradient), with dark/tinted specializations when they differ."""
+    base_cf = (d.get(base_key) or {}).get("canvasFill")
+    base_appearance = "dark" if base_key in ("NSAppearanceNameDarkAqua", "UIAppearanceDark") else None
+    base_fill = cf_to_fill(base_cf, preserve_system_name=True, appearance=base_appearance)
+    if not base_fill:
+        return None, []
+    diffs = []
+    for k, tag in other:
+        if tag is None:
+            continue
+        f = cf_to_fill((d.get(k) or {}).get("canvasFill"),
+                       preserve_system_name=True, appearance=tag)
+        if f != base_fill:
+            diffs.append((tag, f if f is not None else "none"))
+    specs = [{"value": base_fill}] + [
+        {"appearance": tag, "value": f} for tag, f in diffs
+    ] if diffs else []
+    return base_fill, specs
+
+
+def index_appearance(appdata):
+    """Map (group-index, layer-index) -> layer dict for cross-appearance lookup."""
+    m = {}
+    if not isinstance(appdata, dict):
+        return m
+    # Use the ordinal among actual layer groups.  A stack may contain a
+    # different number of leading gradient/color lookups per appearance, so
+    # indexing by the raw stack position can associate the wrong layers.
+    for gi, g in enumerate(group_list(appdata)):
+        for li, l in enumerate(g.get("layers", [])):
+            m[(gi, li)] = l
+    return m
+
+
+def saved_asset(layer):
+    return layer.get("savedSVG") or layer.get("savedImage")
+
+
+def file_digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def copy_asset(src, dst):
+    if src.lower().endswith(".svg"):
+        normalize_svg_copy(src, dst)
+    else:
+        shutil.copy2(src, dst)
+
+
+def variant_asset_name(base_name, appearance, used_names):
+    stem, ext = os.path.splitext(base_name)
+    candidate = "%s.%s%s" % (stem, appearance, ext)
+    n = 2
+    while candidate in used_names:
+        candidate = "%s.%s-%d%s" % (stem, appearance, n, ext)
+        n += 1
+    return candidate
+
+
+RAW_APPEARANCES = {
+    "NSAppearanceNameAqua", "NSAppearanceNameDarkAqua", "ISAppearanceTintable",
+    "UIAppearanceAny", "UIAppearanceDark", "Default", "UIAppearanceLight",
+}
+RAW_SUFFIXES = (
+    "__rawData", "__data", "__srcData", "__sourceData", "__svgData", "__vectorData",
+)
+
+
+def normalized_asset_key(name):
+    return re.sub(r"[^A-Za-z0-9.]+", "", name)
+
+
+def parsed_appearance_name(path, raw=False):
+    stem = path.stem
+    if raw:
+        for suffix in RAW_SUFFIXES:
+            if stem.endswith(suffix):
+                stem = stem[:-len(suffix)]
+                break
+    for appearance in RAW_APPEARANCES:
+        suffix = "__" + appearance
+        if stem.endswith(suffix):
+            return normalized_asset_key(stem[:-len(suffix)]), appearance
+    return None
+
+
+def overlay_raw_svgs(extract_dir, raw_dir):
+    """Replace CoreSVG fallbacks with original rendition bytes when available."""
+    if not raw_dir:
+        return []
+    extract_path = Path(extract_dir)
+    raw_path = Path(raw_dir)
+    full_map = {}
+    for path in extract_path.glob("*.svg"):
+        key = parsed_appearance_name(path)
+        if key:
+            full_map.setdefault(key, path)
+
+    replaced = {}
+    results = []
+    for source in raw_path.glob("*.svg"):
+        key = parsed_appearance_name(source, raw=True)
+        target = full_map.get(key)
+        if not key or not target:
+            continue
+        shutil.copy2(source, target)
+        size = source.stat().st_size
+        replaced[target.name] = size
+        results.append((source.name, target.name, size))
+
+    if not replaced:
+        return results
+
+    extracted_json = extract_path / "extracted.json"
+    document = json.loads(extracted_json.read_text(encoding="utf-8"))
+
+    def update(node):
+        if not isinstance(node, dict):
+            return
+        saved = node.get("savedSVG")
+        if saved in replaced:
+            node["svgSource"] = "raw-SVG-overlay:_rendition.rawData"
+            node["svgBytes"] = replaced[saved]
+            node["rawSVGOverlayApplied"] = True
+        for child in node.get("layers") or []:
+            update(child)
+
+    for appearance in document.values():
+        if isinstance(appearance, dict):
+            for group in appearance.get("groups") or []:
+                update(group)
+    extracted_json.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n",
+                              encoding="utf-8")
+    return results
+
+
+# --- group property values (computed from a raw extracted group dict) ---
+
+def is_icon_group(g):
+    """Accept the original CoreUI class and renamed/private subclasses."""
+    return "IconLayerGroup" in str(g.get("class") or "")
+
+
+def compiled_xcode_major(extract_dir):
+    """Read the AssetStorageVersion recorded by assetutil, when available."""
+    path = os.path.join(extract_dir, "assetutil.json")
+    try:
+        info = json.load(open(path))
+        header = info[0] if isinstance(info, list) and info else {}
+        text = str(header.get("AssetStorageVersion") or "")
+        match = re.search(r"\bXcode\s+(\d+)", text)
+        return int(match.group(1)) if match else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def uses_macos27_schema(d, extract_dir):
+    """Detect Icon Composer 2 metadata, with an override for ambiguous icons."""
+    if FORMAT_MODE in ("27", "macos27", "v2"):
+        return True
+    if FORMAT_MODE in ("26", "macos26", "v1"):
+        return False
+    if FORMAT_MODE != "auto":
+        raise ValueError("DECANT_FORMAT must be auto, 26, or 27")
+    major = compiled_xcode_major(extract_dir)
+    if major is not None:
+        return major >= 27
+    boolean_keys = {
+        "refractionEnabled", "isRefractionEnabled",
+        "refractivityEnabled", "isRefractivityEnabled",
+        "hasRefraction", "hasRefractivity",
+    }
+    for appearance in d.values():
+        if not isinstance(appearance, dict):
+            continue
+        pending = list(appearance.get("groups") or [])
+        while pending:
+            item = pending.pop()
+            # icon-extract records the numeric refraction/specular-placement
+            # properties even for older icons, where they are all zero.  Their
+            # mere presence therefore cannot identify the macOS 27 schema.
+            if any(bool(item.get(key)) for key in boolean_keys):
+                return True
+            if any(float(item.get(key, 0) or 0) != 0 for key in
+                   ("refractionStrength", "refractivityStrength",
+                    "refractionHeight", "refractionDepth", "refractivityDepth",
+                    "specularPlacement", "specularLocation")):
+                return True
+            pending.extend(item.get("layers") or [])
+    return False
+
+def g_blend(g):
+    return BLEND.get(g.get("blendMode", 0), "normal")
+
+def g_lighting(g):
+    return "individual" if g.get("gathersSpecularByElement") else "combined"
+
+def g_specular(g):
+    if not g.get("hasSpecular"):
+        return False
+    placement = g.get("specularPlacement", g.get("specularLocation", 0))
+    if isinstance(placement, str) and placement in ("inside", "outside"):
+        return placement
+    return SPEC_PLACEMENT.get(placement, True)
+
+def g_translucency(g):
+    enabled_keys = ("translucencyEnabled", "isTranslucencyEnabled", "hasTranslucency")
+    enabled = next((bool(g[k]) for k in enabled_keys if k in g), None)
+    # CoreUI's compiled layer-group object does not expose a separate switch on
+    # either the v26 (CoreUI 974) or v27 (CoreUI 1010) catalogs tested. Across
+    # Apple's v27 system icons the compiled convention is zero = disabled and
+    # any nonzero amount = enabled. One remains a valid enabled amount (Pages'
+    # dark pen highlight is an important example).
+    if enabled is None:
+        enabled = abs(float(g.get("translucency", 0) or 0)) > 1e-7
+    return {"enabled": enabled,
+            "value": round(g.get("translucency", 1), 4)}
+
+def g_opacity(g):
+    return round(g.get("opacity", 1), 4)
+
+def g_blur(g):
+    # Zero is meaningful in an appearance specialization: it disables a blur
+    # that is enabled in another appearance.  Returning None here caused the
+    # dark-mode zero to be discarded and the light blur to apply universally.
+    enabled_keys = ("blurEnabled", "isBlurEnabled", "hasBlur")
+    enabled = next((bool(g[k]) for k in enabled_keys if k in g), None)
+    if enabled is False:
+        return 0
+    return round(g.get("blurStrength", 0) or 0, 4)
+
+def g_shadow(g):
+    enabled_keys = ("shadowEnabled", "isShadowEnabled", "hasShadow")
+    enabled = next((bool(g[k]) for k in enabled_keys if k in g), None)
+    style = 0 if enabled is False else g.get("shadowStyle", 0)
+    kind = SHADOW.get(style, "neutral")
+    # CoreUI leaves an undefined/stale opacity in groups whose shadow style is
+    # none (Freeform reports 1.44). Icon Composer still validates the opacity
+    # field even though it does not render it, so use its neutral default.
+    opacity = 0.5 if kind == "none" else round(g.get("shadowOpacity", 0.5), 4)
+    return {"kind": kind, "opacity": opacity}
+
+def g_refractivity(g):
+    s = round(g.get("refractionStrength", g.get("refractivityStrength", 0)) or 0, 4)
+    h = round(g.get("refractionHeight",
+                    g.get("refractionDepth", g.get("refractivityDepth", 0))) or 0, 4)
+    enabled_keys = ("refractionEnabled", "isRefractionEnabled",
+                    "refractivityEnabled", "isRefractivityEnabled",
+                    "hasRefraction", "hasRefractivity")
+    enabled = next((bool(g[k]) for k in enabled_keys if k in g), None)
+    if enabled is None and not (s or h):
+        return None
+    if enabled is None:
+        enabled = True
+    return {"enabled": enabled, "strength": s, "depth": h}
+
+
+def g_refractivity_enabled(g):
+    value = g_refractivity(g)
+    return bool(value and value["enabled"])
+
+
+def meaningful_metadata(value):
+    """Whether an unknown runtime value could affect rendered output."""
+    if value is None or value is False or value == 0 or value == "":
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(meaningful_metadata(v) for v in value)
+    if isinstance(value, dict):
+        # Runtime object descriptions are provenance, not evidence that an
+        # effect is enabled.  Structured numeric/bool values are actionable.
+        if set(value) <= {"class", "description", "bytes"}:
+            return False
+        return any(meaningful_metadata(v) for v in value.values())
+    return True
+
+
+def iter_extracted_nodes(d):
+    """Yield (appearance/path, node) for stacks, groups and layers."""
+    for appearance, appdata in d.items():
+        if not isinstance(appdata, dict) or "groups" not in appdata:
+            continue
+        yield appearance + "/stack", appdata
+
+        def visit(node, path):
+            yield path, node
+            for index, child in enumerate(node.get("layers") or []):
+                label = basename(str(child.get("name") or child.get("class") or index))
+                yield from visit(child, "%s/%s[%d]" % (path, label, index))
+
+        for index, group in enumerate(appdata.get("groups") or []):
+            label = basename(str(group.get("name") or group.get("class") or index))
+            yield from visit(group, "%s/%s[%d]" % (appearance, label, index))
+
+
+def reconstruction_report(d, extract_dir, icon, format27):
+    """Describe reconstruction coverage and every potentially lossy choice."""
+    warnings = []
+    notices = []
+    unknown = []
+    appearances = [k for k, v in d.items()
+                   if isinstance(v, dict) and "groups" in v]
+
+    major = compiled_xcode_major(extract_dir)
+    if major is None:
+        notices.append({
+            "code": "compiler-version-unavailable",
+            "message": "assetutil.json was unavailable; schema version was inferred from effect metadata."
+        })
+
+    for path, node in iter_extracted_nodes(d):
+        metadata = node.get("runtimeMetadata") or {}
+        values = metadata.get("values") or {}
+        types = metadata.get("types") or {}
+        for name, value in values.items():
+            canonical_name = name.lstrip("_")
+            if canonical_name in MAPPED_ACCESSORS or canonical_name in INFORMATIONAL_ACCESSORS:
+                continue
+            # Only warn for names likely to control icon rendering. Other
+            # properties remain inventoried in extracted.json for inspection.
+            lname = name.lower()
+            shaped = any(token in lname for token in
+                         ("blur", "shadow", "specular", "transluc", "refract",
+                          "light", "opacity", "blend", "hidden", "frame",
+                          "position", "transform", "material", "color", "gradient"))
+            item = {"path": path, "accessor": name, "type": types.get(name), "value": value}
+            unknown.append(item)
+            if shaped and meaningful_metadata(value):
+                warnings.append({
+                    "code": "unmapped-runtime-metadata", "path": path,
+                    "field": name,
+                    "message": "CoreUI exposed an active metadata field that is not mapped to icon.json."
+                })
+
+        blend = node.get("blendMode")
+        if blend is not None and blend not in BLEND:
+            warnings.append({"code": "unknown-blend-mode", "path": path, "value": blend})
+        shadow = node.get("shadowStyle")
+        if shadow is not None and shadow not in SHADOW:
+            warnings.append({"code": "unknown-shadow-style", "path": path, "value": shadow})
+        placement = node.get("specularPlacement", node.get("specularLocation"))
+        if isinstance(placement, (int, float)) and placement and placement not in SPEC_PLACEMENT:
+            warnings.append({"code": "unknown-specular-location", "path": path, "value": placement})
+        gradient = node.get("gradient")
+        if gradient and len(gradient.get("colors") or []) > 2:
+            warnings.append({
+                "code": "gradient-stop-limit", "path": path,
+                "message": "Icon Composer accepts two-stop layer gradients; intermediate CoreUI stops were not representable."
+            })
+        explicit_translucency = any(k in node for k in
+                                    ("translucencyEnabled", "isTranslucencyEnabled", "hasTranslucency"))
+        if "translucency" in node and not explicit_translucency:
+            amount = float(node.get("translucency", 0) or 0)
+            notices.append({
+                "code": "compiled-translucency-switch", "path": path,
+                "amount": amount,
+                "inferred-enabled": abs(amount) > 1e-7,
+                "message": "CoreUI stores the rendered translucency switch in the compiled amount: zero is off and nonzero is on."
+            })
+
+        colors = []
+        if isinstance(node.get("color"), dict):
+            colors.append(node["color"])
+        if isinstance(gradient, dict):
+            colors.extend(c for c in gradient.get("colors") or [] if isinstance(c, dict))
+        if path.endswith("/stack"):
+            canvas = node.get("canvasFill") or {}
+            colors.extend(c for c in canvas.get("colors") or [] if isinstance(c, dict))
+            if len(canvas.get("colors") or []) > 2:
+                warnings.append({
+                    "code": "canvas-gradient-stop-limit", "path": path,
+                    "message": "Icon Composer's editable fill cannot represent every CoreUI canvas gradient stop."
+                })
+        for color in colors:
+            space = color.get("colorspace")
+            if space not in CS:
+                warnings.append({
+                    "code": "unknown-color-space", "path": path, "value": space,
+                    "message": "Color was serialized as sRGB because its CoreGraphics color space has no known Icon Composer token."
+                })
+        if node.get("savedSVG") and node.get("svgSource") == "CGSVGDocumentWriteToURL":
+            warnings.append({
+                "code": "regenerated-svg", "path": path,
+                "message": "Original rendition SVG bytes were unavailable; CoreSVG regenerated this asset."
+            })
+        if (node.get("layers") is None and
+                "IconLayerGroup" not in str(node.get("class") or "") and
+                not saved_asset(node) and
+                any(k in node for k in ("opacity", "blendMode", "hasLightingEffects"))):
+            warnings.append({
+                "code": "missing-layer-payload", "path": path,
+                "message": "A rendered layer had no recoverable SVG or bitmap payload."
+            })
+        frame = parse_frame(node.get("frame"))
+        if frame and abs(frame[2] - frame[3]) > 0.01:
+            notices.append({
+                "code": "non-square-frame", "path": path, "frame": list(frame),
+                "message": "Icon Composer exposes uniform scale only; placement uses the longer frame dimension."
+            })
+
+    # Appearance structure differences are supported only when CoreUI returns
+    # stable corresponding nodes. Report them so disappearance/addition of a
+    # layer is never silently treated as a color/effect specialization.
+    structures = {}
+    for appearance in appearances:
+        groups = group_list(d[appearance])
+        structures[appearance] = {
+            "groups": len(groups),
+            "layers-per-group": [len(g.get("layers") or []) for g in groups],
+        }
+    if len({json.dumps(v, sort_keys=True) for v in structures.values()}) > 1:
+        warnings.append({
+            "code": "appearance-structure-differs",
+            "message": "Group/layer counts differ between appearances; inspect alignment before relying on the result.",
+            "structures": structures,
+        })
+
+    # Deduplicate warnings produced by identical default/Aqua lookup objects.
+    seen = set()
+    unique_warnings = []
+    for item in warnings:
+        marker = json.dumps(item, sort_keys=True, default=str)
+        if marker not in seen:
+            seen.add(marker)
+            unique_warnings.append(item)
+
+    return {
+        "report-version": 2,
+        "builder-version": 4,
+        "complete": not unique_warnings,
+        "target-schema": "macOS 27" if format27 else "macOS 26",
+        "asset-compiler-major": major,
+        "extractor": d.get("_decant") or {"extractorSchema": 1},
+        "appearances": appearances,
+        "output": {
+            "groups": len(icon.get("groups") or []),
+            "layers": sum(len(g.get("layers") or []) for g in icon.get("groups") or []),
+            "features": icon.get("features") or [],
+        },
+        "warnings": unique_warnings,
+        "notices": notices,
+        "unmapped-runtime-inventory": unknown,
+    }
+
+
+def specialize(grp, key, value_fn, base_g, peers):
+    """Emit `key` on grp as a scalar, or as `key-specializations` if the value
+    differs across appearances. `peers` is a list of (tag, group_dict). A value
+    of None means 'property absent' for that appearance."""
+    base_val = value_fn(base_g)
+    diffs = []
+    for tag, og in peers:
+        if og is None:
+            continue
+        v = value_fn(og)
+        if v != base_val:
+            diffs.append((tag, v))
+    if not diffs:
+        if base_val is not None:
+            grp[key] = base_val
+        return
+    # Null is a meaningful specialization value: it clears a setting that is
+    # present in another appearance.  Dropping it makes that other value leak
+    # into light/dark/tinted rendering.
+    grp[key + "-specializations"] = ([{"value": base_val}] +
+                                      [{"appearance": tag, "value": v}
+                                       for tag, v in diffs])
+
+
+def group_list(appdata):
+    """Ordered list of real icon-layer groups for an appearance."""
+    if not isinstance(appdata, dict):
+        return []
+    return [g for g in appdata["groups"] if is_icon_group(g)]
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit(__doc__)
+    extract_dir, out = sys.argv[1], sys.argv[2]
+    raw_dir = sys.argv[3] if len(sys.argv) > 3 else None
+    replaced = overlay_raw_svgs(extract_dir, raw_dir)
+    if replaced:
+        print("recovered %d original SVG rendition(s)" % len(replaced))
+    elif raw_dir:
+        print("no original SVG replacements were available; using CoreSVG fallbacks")
+    d = json.load(open(os.path.join(extract_dir, "extracted.json")))
+
+    # Pick the default (light) appearance as the structural base.
+    base_key = next((k for k in BASE_PREFERENCE if isinstance(d.get(k), dict)), None)
+    if base_key is None:
+        base_key = next(k for k, v in d.items()
+                        if isinstance(v, dict) and "groups" in v)
+    base = d[base_key]
+    other = []
+    seen_specializations = set()
+    for k, tag in APPEARANCE_TAGS:
+        if k == base_key or not isinstance(d.get(k), dict):
+            continue
+        if tag is not None:
+            if tag in seen_specializations:
+                continue
+            seen_specializations.add(tag)
+        other.append((k, tag))
+    idx = {k: index_appearance(d[k]) for k, _ in other}
+    # Per-appearance group lists, aligned by real-group ordinal, for group-level
+    # specializations (blend-mode, specular, translucency, etc. that vary by mode).
+    other_groups = [(tag, group_list(d[k])) for k, tag in other if tag is not None]
+    base_rgi = -1  # ordinal among real (non-placeholder) base groups
+
+    assets_dir = os.path.join(out, "Assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    used_asset_names = set()
+    asset_name_by_digest = {}
+
+    def install_asset(saved, preferred, appearance="variant"):
+        """Copy one unique payload and reuse it when appearances share bytes."""
+        src = os.path.join(extract_dir, saved)
+        digest = file_digest(src)
+        if digest in asset_name_by_digest:
+            return asset_name_by_digest[digest]
+        name = preferred
+        if name in used_asset_names:
+            name = variant_asset_name(preferred, appearance, used_asset_names)
+        copy_asset(src, os.path.join(assets_dir, name))
+        used_asset_names.add(name)
+        asset_name_by_digest[digest] = name
+        return name
+    groups_out = []
+    bottom_fill = None
+    uses_refraction = False
+    uses_specular_location = False
+
+    for gi, g in enumerate(base["groups"]):
+        if not is_icon_group(g):
+            continue  # skip top-level gradient/color placeholder entries
+        base_rgi += 1
+        # aligned peer groups in other appearances (by real-group ordinal)
+        peers = [(tag, (glist[base_rgi] if base_rgi < len(glist) else None))
+                 for tag, glist in other_groups]
+        group_pos = position_for(g.get("frame"))
+        layers_out = []
+        for li, l in enumerate(g.get("layers", [])):
+            saved = saved_asset(l)
+            if not saved:
+                continue
+            ext = os.path.splitext(saved)[1]
+            preferred = basename(l["name"]) + ext
+            clean = install_asset(saved, preferred, "base")
+
+            # Preserve distinct dark/tinted artwork rather than always pointing
+            # every appearance at the light payload.
+            image_overrides = []
+            for k, tag in other:
+                if tag is None:
+                    continue
+                la = idx[k].get((base_rgi, li))
+                if la is None or not saved_asset(la):
+                    continue
+                variant_saved = saved_asset(la)
+                variant_ext = os.path.splitext(variant_saved)[1] or ext
+                variant_preferred = basename(la.get("name") or l["name"]) + variant_ext
+                variant_name = install_asset(variant_saved, variant_preferred, tag)
+                if variant_name != clean:
+                    image_overrides.append({"appearance": tag, "value": variant_name})
+
+            f0 = fill(l)
+            if f0 and bottom_fill is None:
+                bottom_fill = f0  # first fill in stack order = bottom-most (backmost) layer
+            # appearance-specific fill overrides (vs the base/light fill)
+            overrides = []
+            for k, tag in other:
+                la = idx[k].get((base_rgi, li))
+                if la is None:
+                    continue
+                fa = fill(la)
+                if fa != f0 and tag is not None:
+                    # A missing CoreUI fill means use the artwork's own colors.
+                    overrides.append({"appearance": tag,
+                                      "value": fa if fa is not None else "none"})
+            layer = {"image-name": clean, "name": basename(l["name"])}
+            if image_overrides:
+                layer["image-name-specializations"] = [{"value": clean}] + image_overrides
+            # Fill emission. A base fill of None means "no override — use the
+            # artwork's own colors" (e.g. an SVG with its own gradient). In that
+            # case only the appearance overrides go into fill-specializations,
+            # WITHOUT a base value entry — otherwise an appearance-only override
+            # (like tinted's gray) would wrongly recolor light/dark too.
+            if f0 is None:
+                if overrides:
+                    layer["fill-specializations"] = overrides
+            elif overrides:
+                layer["fill-specializations"] = [{"value": f0}] + overrides
+            else:
+                layer["fill"] = f0
+
+            # Layer properties that can vary per appearance. Emitting these as
+            # `<key>-specializations` is essential: e.g. App Store's "1.light"
+            # layer has opacity 0 in light but 0.89 in dark — without the dark
+            # specialization actool drops the (base-0-opacity) layer entirely.
+            def peer(tag_key):
+                return idx[tag_key].get((base_rgi, li))
+
+            no_default = object()
+
+            def lspecialize(key, value_fn, *, omit_if_default=no_default):
+                base_v = value_fn(l)
+                diffs = []
+                for k, tag in other:
+                    if tag is None:
+                        continue
+                    la = peer(k)
+                    if la is None:
+                        continue
+                    v = value_fn(la)
+                    if v != base_v:
+                        diffs.append((tag, v))
+                if diffs:
+                    arr = [{"value": base_v}] + [{"appearance": t, "value": v} for t, v in diffs]
+                    layer[key + "-specializations"] = arr
+                elif omit_if_default is no_default or base_v != omit_if_default:
+                    layer[key] = base_v
+
+            lspecialize("blend-mode", lambda x: BLEND.get(x.get("blendMode", 0), "normal"),
+                        omit_if_default="normal")
+            lspecialize("opacity", lambda x: round(x.get("opacity", 1), 4),
+                        omit_if_default=1)
+            lspecialize("hidden", lambda x: bool(x.get("hidden", False)),
+                        omit_if_default=False)
+            lspecialize("position", lambda x: position_for(x.get("frame")),
+                        omit_if_default=None)
+            # glass (== hasLightingEffects): refraction/specular only render on
+            # glass layers, so this is always emitted.
+            lspecialize("glass", lambda x: bool(x.get("hasLightingEffects")))
+            layers_out.append(layer)
+
+        # CoreUI stores layers back-to-front; .icon lists them front-to-back.
+        layers_out.reverse()
+
+        grp = {"layers": layers_out}
+        if g.get("name"):
+            grp["name"] = basename(g["name"])
+        # Group properties that can vary per appearance -> emit a scalar, or a
+        # `<key>-specializations` array when light/dark/tinted differ.
+        specialize(grp, "hidden", lambda x: bool(x.get("hidden", False)), g, peers)
+        specialize(grp, "position", lambda x: position_for(x.get("frame")), g, peers)
+        specialize(grp, "blend-mode", g_blend, g, peers)
+        specialize(grp, "lighting", g_lighting, g, peers)
+        specialize(grp, "specular", g_specular, g, peers)
+        specialize(grp, "translucency", g_translucency, g, peers)
+        specialize(grp, "refractivity", g_refractivity, g, peers)
+        specialize(grp, "shadow", g_shadow, g, peers)
+        # opacity / blur only when non-default (still appearance-aware)
+        if g_opacity(g) != 1 or any(og and g_opacity(og) != 1 for _, og in peers):
+            specialize(grp, "opacity", g_opacity, g, peers)
+        if g_blur(g) != 0 or any(og and g_blur(og) != 0 for _, og in peers):
+            specialize(grp, "blur-material", g_blur, g, peers)
+
+        # feature flags (consider all appearances)
+        if g_refractivity_enabled(g) or any(og and g_refractivity_enabled(og) for _, og in peers):
+            uses_refraction = True
+        if g_specular(g) in ("inside", "outside") or \
+           any(og and g_specular(og) in ("inside", "outside") for _, og in peers):
+            uses_specular_location = True
+        groups_out.append(grp)
+
+    # CoreUI stores groups back-to-front; .icon lists them front-to-back.
+    groups_out.reverse()
+
+    # Top-level canvas fill. Prefer the icon's authored background gradient
+    # ("system-light"/"system-dark" named gradients) when present; otherwise
+    # fall back to deriving from the bottom-most layer's fill.
+    top_fill, top_fill_specs = canvas_fill(d, base_key, other)
+    if top_fill is None:
+        if bottom_fill and "solid" in bottom_fill:
+            top_fill = {"automatic-gradient": bottom_fill["solid"]}
+        elif bottom_fill and "linear-gradient" in bottom_fill:
+            top_fill = {"automatic-gradient": bottom_fill["linear-gradient"][-1]}
+        else:
+            top_fill = {"automatic-gradient": "srgb:0.50000,0.50000,0.50000,1.00000"}
+
+    features = []
+    if uses_refraction:
+        features.append("refractivity")
+    if uses_specular_location:
+        features.append("specular-location")
+
+    icon = {}
+    if features:
+        icon["features"] = features
+    if top_fill_specs:
+        icon["fill-specializations"] = top_fill_specs
+    else:
+        icon["fill"] = top_fill
+    icon["groups"] = groups_out
+    format27 = uses_macos27_schema(d, extract_dir)
+    if format27:
+        icon["supported-platforms"] = {"squares": "shared"}
+    else:
+        icon["supported-platforms"] = {"squares": ["macOS"]}
+    with open(os.path.join(out, "icon.json"), "w") as f:
+        json.dump(icon, f, indent=2)
+
+    report = reconstruction_report(d, extract_dir, icon, format27)
+    report_path = os.environ.get("DECANT_REPORT") or os.path.join(extract_dir, "reconstruction-report.json")
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+    nlayers = sum(len(g["layers"]) for g in groups_out)
+    print("wrote %s  (%d groups, %d layers, schema=%s)" %
+          (out, len(groups_out), nlayers, 27 if format27 else 26))
+    print("coverage report -> %s" % report_path)
+    if report["warnings"]:
+        print("WARNING: %d reconstruction coverage issue(s); inspect the report." %
+              len(report["warnings"]), file=sys.stderr)
+        if STRICT_MODE:
+            print("DECANT_STRICT=1: refusing to certify this extraction as complete.", file=sys.stderr)
+            return 3
+    else:
+        print("coverage: all active metadata exposed by this CoreUI build was mapped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__DECANT_BUILDER_PY__
+
+
+print "Decant $VERSION"
+print "1/6 Inspecting asset catalog..."
+xcrun assetutil --info "$CAR" > "$EXTRACT_DIR/assetutil.json"
+
+STACK=$(python3 - "$BUNDLE_ICON_NAME" "$EXTRACT_DIR/assetutil.json" <<'__DECANT_STACK_PY__'
+import json
+import sys
+from pathlib import Path
+
+preferred = sys.argv[1]
+items = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+stacks = []
+for item in items:
+    if item.get("AssetType") == "IconImageStack":
+        name = item.get("Name")
+        if name and name not in stacks:
+            stacks.append(name)
+
+if not stacks:
+    raise SystemExit("no IconImageStack found in Assets.car")
+
+for candidate in (preferred, "AppIcon", "AppIconUpdated", "Settings"):
+    if candidate and candidate in stacks:
+        print(candidate)
+        break
+else:
+    print(stacks[0])
+__DECANT_STACK_PY__
+) || die "could not determine the main icon stack"
+
+print "App:   $APP_NAME"
+print "Stack: $STACK"
+print "Out:   $OUT_ICON"
+
+print "2/6 Compiling embedded extractors..."
+clang -fobjc-arc \
+  -framework Foundation \
+  -framework CoreGraphics \
+  -framework ImageIO \
+  -framework AppKit \
+  "$META_SRC" \
+  -o "$WORK/icon-extract"
+
+clang -fobjc-arc \
+  -framework Foundation \
+  "$RAW_SRC" \
+  -o "$WORK/rawsvg-extract"
+
+print "3/6 Extracting layer structure and metadata..."
+"$WORK/icon-extract" "$CAR" "$STACK" "$EXTRACT_DIR"
+
+print "4/6 Recovering original SVG rendition data..."
+"$WORK/rawsvg-extract" "$CAR" "$STACK" "$RAW_SVG_DIR"
+
+print "5/6 Building the editable icon bundle..."
+BUILD_STATUS=0
+python3 "$BUILDER" "$EXTRACT_DIR" "$RESULT_ICON" "$RAW_SVG_DIR" || BUILD_STATUS=$?
+
+if [[ -d "$RESULT_ICON" ]]; then
+  [[ -e "$OUT_ICON" ]] && /bin/rm -rf -- "$OUT_ICON"
+  mv "$RESULT_ICON" "$OUT_ICON"
+fi
+
+if (( BUILD_STATUS != 0 )); then
+  exit "$BUILD_STATUS"
+fi
+
+print "6/6 Done"
+print "done -> $OUT_ICON"
