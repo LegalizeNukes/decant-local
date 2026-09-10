@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-VERSION="4.0.1"
+VERSION="4.0.2"
 
 usage() {
   local exit_code="${1:-2}"
@@ -784,10 +784,9 @@ BLEND = {0: "normal", 1: "multiply", 2: "screen", 3: "overlay", 4: "darken",
          9: "hard-light", 10: "difference", 11: "exclusion", 12: "hue",
          13: "saturation", 14: "color", 15: "luminosity",
          26: "plus-darker", 27: "plus-lighter"}
-# shadowStyle integer -> .icon shadow kind. CoreUI style 2 is not stable enough
-# to serialize as Chromatic across the v26/v27 Icon Composer schemas; the
-# legacy-safe Neutral representation opens correctly in both.
-SHADOW = {0: "none", 2: "neutral", 3: "neutral"}
+# shadowStyle integer -> .icon shadow kind. Photos confirms the distinction:
+# its light/dark groups use 2 (Chromatic), while tinted uses 3 (Neutral).
+SHADOW = {0: "none", 2: "chromatic", 3: "neutral"}
 # specularPlacement integer -> .icon specular location (calibrated: 1=inside, 2=outside)
 SPEC_PLACEMENT = {1: "inside", 2: "outside"}
 # CGColorSpace name -> .icon color-space token
