@@ -1,4 +1,4 @@
-# decant-local
+# Decant Local
 
 Decant recovers editable layered `.icon` documents from compiled macOS app
 icons. This version is a single self-contained script targeting macOS 26 and
