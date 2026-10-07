@@ -2,7 +2,7 @@
 
 **Recover layered, editable macOS Liquid Glass app icons directly from local asset catalogs.**
 
-Decant Local is a local-first fork of [Decant](https://github.com/kylebshr/decant). Its main executable, **Decant 4**, extracts a macOS application's icon stack from `Assets.car` and reconstructs an `.icon` bundle for Apple's Icon Composer. It is intended for inspecting, preserving, and editing icons already installed on your Mac—without downloading an IPSW or installing a simulator runtime.
+Decant Local is a local-first fork of [Decant](https://github.com/kylebshr/decant). Its main executable extracts a macOS application's icon stack from `Assets.car` and reconstructs an `.icon` bundle for Apple's Icon Composer. It is intended for inspecting, preserving, and editing icons already installed on your Mac—without downloading an IPSW or installing a simulator runtime.
 
 Unlike a flattened PNG export, the reconstruction aims to retain the icon's layer/group hierarchy, original SVG artwork when available, raster layers, appearance variants, and supported visual-effect metadata. **The result is editable, but exact fidelity is not guaranteed:** private CoreUI data is not always fully representable in an `.icon` document.
 
